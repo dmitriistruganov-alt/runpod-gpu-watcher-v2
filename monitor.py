@@ -73,7 +73,7 @@ def runpod_gql(query: str) -> dict:
         if resp.status != 200:
             print(f"[RunPod] HTTP {resp.status}: {raw[:200]}")
             return {}
-        return json.loads(raw).get("data", {})
+        return json.loads(raw).get("data") or {}
     except Exception as e:
         print(f"[RunPod] Error: {e}")
         conn.close()
