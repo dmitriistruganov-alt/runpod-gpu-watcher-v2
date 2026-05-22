@@ -1,1 +1,6 @@
-{"status": null, "gpus": null, "report_ts": 0, "n": 0}
+{
+  "status": "EXITED",
+  "gpus": 0,
+  "report_ts": 1779461397,
+  "n": 0
+}
