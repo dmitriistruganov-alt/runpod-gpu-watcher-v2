@@ -210,4 +210,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        msg = f"⚠️ <b>GPU Watcher ошибка</b>\n<code>{type(e).__name__}: {e}</code>"
+        send_tg(msg)
+        print(f"[FATAL] {e}")
+        sys.exit(0)  # выходим с 0 чтобы GitHub не слал email
