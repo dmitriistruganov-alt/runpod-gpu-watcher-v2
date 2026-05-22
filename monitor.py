@@ -107,7 +107,7 @@ def resume_pod() -> bool:
     q = ('mutation { podResume(input: {podId: "%s", gpuCount: 1}) '
          '{ id desiredStatus } }') % POD_ID
     data = runpod_gql(q)
-    result = data.get("podResume", {})
+    result = data.get("podResume") or {}
     new_status = result.get("desiredStatus", "")
     print(f"[RESUME] podResume → {new_status}")
     return new_status == "RUNNING"
