@@ -39,15 +39,25 @@ def get_pod():
     if not RUNPOD_KEY:
         print("[ERROR] RUNPOD_KEY не задан")
         return None
-    query = '{"query":"{pod(input:{podId:\\"%s\\"}){desiredStatus runtime{uptimeInSeconds gpus{gpuUtilPercent memoryUtilPercent}}}}"}'
-    data = (query % POD_ID).encode()
-    req = urllib.request.Request(
-        f"https://api.runpod.io/graphql?api_key={RUNPOD_KEY}",
-        data=data, headers={"Content-Type": "application/json"}
+    import http.client, ssl
+    gql = ('{ pod(input: {podId: "%s"}) { desiredStatus runtime { '
+           'uptimeInSeconds gpus { gpuUtilPercent memoryUtilPercent } } } }') % POD_ID
+    body = json.dumps({"query": gql}).encode("utf-8")
+    ctx = ssl.create_default_context()
+    conn = http.client.HTTPSConnection("api.runpod.io", timeout=15, context=ctx)
+    conn.request(
+        "POST",
+        f"/graphql?api_key={RUNPOD_KEY}",
+        body=body,
+        headers={"Content-Type": "application/json", "User-Agent": "runpod-watcher/1.0"}
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        resp = json.loads(r.read())
-    pod = resp.get("data", {}).get("pod", {})
+    resp = conn.getresponse()
+    raw = resp.read().decode("utf-8")
+    conn.close()
+    if resp.status != 200:
+        raise Exception(f"RunPod API HTTP {resp.status}: {raw[:200]}")
+    data = json.loads(raw)
+    pod = data.get("data", {}).get("pod", {})
     rt = pod.get("runtime")
     gpus = rt.get("gpus", []) if rt else []
     uptime = rt.get("uptimeInSeconds", 0) if rt else 0
