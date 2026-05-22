@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+api/
+vercel.json
+requirements.txt
+gpu_watcher_*.py
