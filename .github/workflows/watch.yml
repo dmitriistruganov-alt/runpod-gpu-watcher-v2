@@ -25,10 +25,11 @@ jobs:
 
       - name: Run monitor
         env:
-          TG_TOKEN:   ${{ secrets.TG_TOKEN }}
-          TG_CHAT:    ${{ secrets.TG_CHAT }}
-          RUNPOD_KEY: ${{ secrets.RUNPOD_KEY }}
-          POD_ID:     ${{ secrets.POD_ID }}
+          TG_TOKEN:    ${{ secrets.TG_TOKEN }}
+          TG_CHAT:     ${{ secrets.TG_CHAT }}
+          RUNPOD_KEY:  ${{ secrets.RUNPOD_KEY }}
+          POD_ID:      ${{ secrets.POD_ID }}
+          AUTO_RESUME: ${{ secrets.AUTO_RESUME }}
         run: python monitor.py
 
       - name: Save state
