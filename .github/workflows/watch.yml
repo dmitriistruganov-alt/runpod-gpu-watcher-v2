@@ -2,7 +2,7 @@ name: RunPod GPU Watcher
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # каждые 5 минут (резервный)
+    - cron: '* * * * *'     # каждую минуту (GitHub может throttle до ~1/мин)
   workflow_dispatch:          # ручной запуск
   repository_dispatch:
     types: [cron-trigger]     # cron-job.org каждую минуту
