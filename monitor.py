@@ -15,15 +15,6 @@ POD_ID      = os.environ.get("POD_ID",  "06187ayaswoyq2")
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "0") == "1"
 STATE_FILE  = Path("state.json")
 
-JUPYTER_START_CMD = (
-    "mkdir -p /tmp/jupyter_runtime /root/jupyter_logs && "
-    "export JUPYTER_RUNTIME_DIR=/tmp/jupyter_runtime && "
-    "if ! pgrep -f jupyter-watchdog > /dev/null 2>&1; then "
-    "nohup bash /root/jupyter-watchdog.sh > /root/jupyter_logs/watchdog.log 2>&1 & disown; "
-    "echo JUPYTER_WATCHDOG_STARTED; "
-    "else echo JUPYTER_WATCHDOG_ALREADY_RUNNING; fi"
-)
-
 
 def pdt():
     import time as t
@@ -122,23 +113,12 @@ def resume_pod() -> bool:
     return new_status == "RUNNING"
 
 
-def start_jupyter() -> str:
-    """Запустить Jupyter watchdog через RunPod exec API."""
-    cmd_escaped = JUPYTER_START_CMD.replace('"', '\\"')
-    q = ('mutation { podExec(input: {podId: "%s", '
-         'command: ["bash", "-c", "%s"]}) { output } }') % (POD_ID, cmd_escaped)
-    data = runpod_gql(q)
-    result = data.get("podExec") or {}
-    output = result.get("output", "no output")
-    print(f"[JUPYTER] exec result: {output[:100]}")
-    return output
-
 
 def load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text())
     except:
-        return {"status": None, "gpus": None, "report_ts": 0, "n": 0, "jupyter_started": False}
+        return {"status": None, "gpus": None, "report_ts": 0, "n": 0}
 
 
 def save_state(s: dict):
@@ -169,14 +149,13 @@ def main():
             send_tg(
                 f"🟢 <b>Pod ЗАПУСТИЛСЯ!</b>  {pdt()}\n"
                 f"GPU: {cur_g} шт\n"
-                f"Uptime: {fmt_up(pod['uptime'])}"
+                f"Uptime: {fmt_up(pod['uptime'])}\n\n"
+                f"⚡ Запусти Jupyter:\n"
+                f"<code>bash /root/jupyter-watchdog.sh &</code>"
             )
-            # Запускаем Jupyter сразу как под стартовал
-            state["jupyter_started"] = False
 
         if prev_s == "RUNNING" and cur_s == "EXITED":
             send_tg(f"🔴 <b>Pod ОСТАНОВИЛСЯ</b>  {pdt()}\nPod: {POD_ID}")
-            state["jupyter_started"] = False
 
         if prev_g == 0 and cur_g > 0 and pod["running"]:
             send_tg(
@@ -187,19 +166,6 @@ def main():
 
         if prev_g is not None and prev_g > 0 and cur_g == 0 and pod["running"]:
             send_tg(f"⚠️ <b>GPU ПРОПАЛ</b> при работающем поде!  {pdt()}")
-
-    # ── Авто-запуск Jupyter когда под работает ─────────────────────────────
-    if cur_s == "RUNNING" and not state.get("jupyter_started", False):
-        print("[JUPYTER] Pod RUNNING → запускаем Jupyter watchdog...")
-        out = start_jupyter()
-        if "STARTED" in out or "RUNNING" in out or "output" in out.lower():
-            state["jupyter_started"] = True
-            send_tg(
-                f"🪐 <b>Jupyter запущен!</b>  {pdt()}\n"
-                f"https://{POD_ID}-8888.proxy.runpod.net"
-            )
-        else:
-            print(f"[JUPYTER] Не удалось запустить: {out}")
 
     # ── Авто-запуск пода ────────────────────────────────────────────────────
     if AUTO_RESUME and cur_s == "EXITED":
