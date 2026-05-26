@@ -2,7 +2,7 @@ name: RunPod GPU Watcher
 
 on:
   schedule:
-    - cron: '* * * * *'   # каждую минуту — быстрое обнаружение GPU
+    - cron: '*/5 * * * *'   # backup: каждые 5 мин на случай обрыва цепи
   workflow_dispatch:
 
 concurrency:
@@ -41,3 +41,11 @@ jobs:
         with:
           commit_message: "state update"
           file_pattern: state.json
+
+      - name: Queue next run in ~55s
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 55
+          gh workflow run watch.yml --repo ${{ github.repository }} || true
