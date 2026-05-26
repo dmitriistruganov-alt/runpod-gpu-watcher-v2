@@ -2,10 +2,9 @@ name: RunPod GPU Watcher
 
 on:
   schedule:
-    - cron: '*/20 * * * *'   # каждые 20 минут = 1 попытка запуска за цикл
+    - cron: '*/10 * * * *'   # каждые 10 минут
   workflow_dispatch:
 
-# Не запускать параллельно — предыдущий должен закончить и закоммитить state.json
 concurrency:
   group: runpod-watcher
   cancel-in-progress: false
