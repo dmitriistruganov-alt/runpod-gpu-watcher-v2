@@ -1,6 +1,6 @@
 {
-  "status": "RUNNING",
-  "gpus": 1,
-  "report_ts": 1779493630,
-  "n": 28
+  "status": "EXITED",
+  "gpus": 0,
+  "report_ts": 1779776236,
+  "n": 0
 }
