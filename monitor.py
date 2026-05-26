@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-RunPod GPU Monitor v3 — строгая верификация GPU.
-"Pod запущен" ТОЛЬКО когда: desiredStatus=RUNNING + runtime IS NOT NULL + gpus > 0
-State: state.json (коммитится в репо)
+RunPod GPU Monitor v4
+- Проверка каждую минуту (cron * * * * *)
+- podResume при каждой проверке если pod EXITED (без TG на каждую попытку)
+- Отчёт каждые 20 мин: сколько проверок, попыток, статус
+- GPU подтверждён (runtime + gpus) -> немедленный TG
 """
 import json, os, sys, time
 import http.client, ssl
@@ -15,7 +17,7 @@ POD_ID      = os.environ.get("POD_ID",  "06187ayaswoyq2")
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "0") == "1"
 STATE_FILE  = Path("state.json")
 
-RESUME_COOLDOWN = 9 * 60   # попытка каждые 10 мин (9 = с запасом для cron drift)
+REPORT_EVERY = 20 * 60   # отчёт каждые 20 мин
 
 
 def pdt():
@@ -24,7 +26,8 @@ def pdt():
 
 
 def fmt_up(sec):
-    return f"{sec // 3600}h {(sec % 3600) // 60}m"
+    h, m = sec // 3600, (sec % 3600) // 60
+    return f"{h}h {m}m"
 
 
 def send_tg(text: str):
@@ -33,22 +36,14 @@ def send_tg(text: str):
         return
     import urllib.request
     try:
-        data = json.dumps({
-            "chat_id": TG_CHAT,
-            "text": text,
-            "parse_mode": "HTML"
-        }).encode()
+        data = json.dumps({"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data=data,
-            headers={"Content-Type": "application/json"}
+            data=data, headers={"Content-Type": "application/json"}
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             res = json.loads(r.read())
-            if res.get("ok"):
-                print(f"[TG OK] {text[:80]}")
-            else:
-                print(f"[TG FAIL] {res}")
+            print(f"[TG {'OK' if res.get('ok') else 'FAIL'}] {text[:60]}")
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
@@ -61,12 +56,8 @@ def runpod_gql(query: str) -> dict:
     ctx  = ssl.create_default_context()
     conn = http.client.HTTPSConnection("api.runpod.io", timeout=20, context=ctx)
     try:
-        conn.request(
-            "POST",
-            f"/graphql?api_key={RUNPOD_KEY}",
-            body=body,
-            headers={"Content-Type": "application/json", "User-Agent": "runpod-watcher/3.0"}
-        )
+        conn.request("POST", f"/graphql?api_key={RUNPOD_KEY}", body=body,
+                     headers={"Content-Type": "application/json", "User-Agent": "runpod-watcher/4.0"})
         resp = conn.getresponse()
         raw  = resp.read().decode("utf-8")
         conn.close()
@@ -76,17 +67,14 @@ def runpod_gql(query: str) -> dict:
         return json.loads(raw).get("data") or {}
     except Exception as e:
         print(f"[RunPod] Error: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.close()
+        except: pass
         return {}
 
 
 def get_pod() -> dict | None:
     """
-    Получить статус пода.
-    running=True ТОЛЬКО если runtime существует (GPU выделен).
+    running=True ТОЛЬКО если runtime не None (GPU физически выделен).
     desiredStatus=RUNNING без runtime = под в очереди, GPU ещё не дали.
     """
     q = ('{ pod(input: {podId: "%s"}) { desiredStatus runtime { '
@@ -109,22 +97,21 @@ def get_pod() -> dict | None:
     }
 
 
-def try_resume_pod() -> str:
+def try_resume(silent=True) -> bool:
     """
-    Отправить запрос на запуск пода.
-    Возвращает 'queued' или 'error'.
-    ВАЖНО: desiredStatus=RUNNING = запрос принят, НЕ = GPU выделен.
-    Результат этой функции НИКОГДА не считается подтверждением GPU.
+    Запрос на запуск пода. silent=True — не шлём TG на каждую попытку.
+    Возвращает True если запрос принят.
+    НИКОГДА не считаем success = GPU выделен.
     """
     q = ('mutation { podResume(input: {podId: "%s", gpuCount: 1}) '
          '{ id desiredStatus } }') % POD_ID
     data = runpod_gql(q)
     if not data:
-        return "error"
+        return False
     result = data.get("podResume") or {}
     new_status = result.get("desiredStatus", "")
-    print(f"[RESUME] podResume -> desiredStatus={new_status!r}")
-    return "queued" if new_status else "error"
+    print(f"[RESUME] podResume -> {new_status!r}")
+    return bool(new_status)
 
 
 def load_state() -> dict:
@@ -139,7 +126,7 @@ def save_state(s: dict):
 
 
 def main():
-    print(f"[{pdt()}] RunPod Monitor v3 | AUTO_RESUME={AUTO_RESUME}")
+    print(f"[{pdt()}] RunPod Monitor v4 | AUTO_RESUME={AUTO_RESUME}")
 
     pod = get_pod()
     if pod is None:
@@ -148,28 +135,26 @@ def main():
     state = load_state()
     now   = int(time.time())
 
-    prev_s        = state.get("status")
     prev_running  = state.get("running")
     gpu_confirmed = state.get("gpu_confirmed", False)
-    last_resume   = state.get("last_resume_ts", 0)
-    attempts      = state.get("resume_attempts", 0)
-    n             = state.get("n", 0) + 1
+    checks        = state.get("checks", 0) + 1   # проверок с последнего отчёта
+    attempts      = state.get("attempts", 0)       # попыток resume с последнего отчёта
+    total_att     = state.get("total_att", 0)      # всего попыток
 
     cur_s       = pod["status"]
     cur_running = pod["running"]
     cur_g       = pod["gpus"]
 
-    # GPU реально готов: RUNNING + runtime существует + GPUs > 0
+    # GPU реально готов
     truly_ready = cur_s == "RUNNING" and cur_running and cur_g > 0
 
     print(f"desiredStatus={cur_s} | runtime={'YES' if cur_running else 'NO'} | GPUs={cur_g}")
-    print(f"prev: status={prev_s} running={prev_running} | gpu_confirmed={gpu_confirmed}")
 
-    # ── GPU подтверждён впервые в этой сессии ────────────────────────────────
+    # ── GPU подтверждён впервые ─────────────────────────────────────────────
     if truly_ready and not gpu_confirmed:
         send_tg(
-            f"<b>GPU ГОТОВ! Под работает!</b>  {pdt()}\n"
-            f"GPU: {cur_g} | Util: {pod['gpu_util']}%\n"
+            f"<b>GPU ЗАПУЩЕН! Заходи и включай под!</b>\n"
+            f"GPU: {cur_g} шт | Util: {pod['gpu_util']}%\n"
             f"Uptime: {fmt_up(pod['uptime'])}\n"
             f"Pod: <code>{POD_ID}</code>\n\n"
             f"Запусти:\n"
@@ -177,78 +162,64 @@ def main():
             f"<code>bash /root/xmode_stabilize.sh</code>"
         )
         state["gpu_confirmed"] = True
-        state["resume_attempts"] = 0
+        state["total_att"] = 0
 
-    # ── Под остановился (был running, теперь нет) ────────────────────────────
+    # ── Под остановился ─────────────────────────────────────────────────────
     elif prev_running and not cur_running:
         send_tg(f"<b>Под остановился</b>  {pdt()}\nPod: {POD_ID}")
         state["gpu_confirmed"] = False
-        state["resume_attempts"] = 0
+        state["total_att"] = 0
 
-    # ── desiredStatus=RUNNING но runtime=None (в очереди) ────────────────────
     elif cur_s == "RUNNING" and not cur_running:
-        print(f"[WAIT] desiredStatus=RUNNING но runtime=None — ждём GPU...")
+        print(f"[WAIT] desiredStatus=RUNNING но runtime=None — в очереди...")
 
-    # ── Авто-резюм при EXITED ─────────────────────────────────────────────────
+    # ── Авто-резюм при каждом EXITED ────────────────────────────────────────
     if AUTO_RESUME and cur_s == "EXITED":
-        if now - last_resume >= RESUME_COOLDOWN:
-            print(f"[AUTO_RESUME] EXITED -> попытка #{attempts + 1}")
-            result = try_resume_pod()
-            state["last_resume_ts"] = now
-            state["resume_attempts"] = attempts + 1
+        ok = try_resume(silent=True)   # без TG — отчёт каждые 20 мин
+        if ok:
+            attempts  += 1
+            total_att = state.get("total_att", 0) + 1
+            state["attempts"] = attempts
+            state["total_att"] = total_att
+            print(f"[RESUME] Попытка #{total_att}")
 
-            if result == "queued":
-                send_tg(
-                    f"Запрос на запуск пода  {pdt()}\n"
-                    f"Попытка #{attempts + 1} | Pod: <code>{POD_ID}</code>\n"
-                    f"Ждём GPU... проверка через 10 мин"
-                )
-            else:
-                print("[AUTO_RESUME] podResume вернул ошибку — GPU недоступен")
-        else:
-            wait_min = (RESUME_COOLDOWN - (now - last_resume)) // 60
-            print(f"[AUTO_RESUME] Кулдаун — следующая попытка через {wait_min} мин")
-
-    # ── Отчёт каждые 10 мин ──────────────────────────────────────────────────
-    if now - state.get("report_ts", 0) >= 20 * 60:
-        att = state.get("resume_attempts", 0)
+    # ── Отчёт каждые 20 мин ─────────────────────────────────────────────────
+    state["checks"] = checks
+    if now - state.get("report_ts", 0) >= REPORT_EVERY:
         if truly_ready:
             msg = (
-                f"RunPod Отчёт  {pdt()}\n"
+                f"RunPod  {pdt()}\n"
                 f"РАБОТАЕТ | GPU: {cur_g}\n"
-                f"Util: {pod['gpu_util']}% | Mem: {pod['gpu_mem']}%\n"
-                f"Uptime: {fmt_up(pod['uptime'])}"
+                f"Util: {pod['gpu_util']}% | Uptime: {fmt_up(pod['uptime'])}"
             )
         elif cur_s == "RUNNING" and not cur_running:
             msg = (
-                f"RunPod Отчёт  {pdt()}\n"
-                f"В очереди (desiredStatus=RUNNING, runtime=None)\n"
-                f"Попыток запуска: {att}"
+                f"RunPod  {pdt()}\n"
+                f"В очереди (ждём GPU)\n"
+                f"Проверок за 20 мин: {checks} | Попыток запуска: {attempts}"
             )
         else:
             msg = (
-                f"RunPod Отчёт  {pdt()}\n"
+                f"RunPod  {pdt()}\n"
                 f"ВЫКЛЮЧЕН\n"
-                f"Попыток запуска: {att}\n"
-                f"Проверок: {n}"
+                f"Проверок за 20 мин: {checks} | Попыток запуска: {attempts}"
             )
         send_tg(msg)
         state["report_ts"] = now
-        state["n"] = 0
+        state["checks"]    = 0
+        state["attempts"]  = 0
 
     state["status"]  = cur_s
     state["running"] = cur_running
     state["gpus"]    = cur_g
-    state["n"]       = n
     save_state(state)
-    print("[DONE] state saved")
+    print(f"[DONE] checks={checks} attempts={attempts}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        msg = f"GPU Watcher ошибка: {type(e).__name__}: {e}"
-        send_tg(msg)
+        send_tg(f"GPU Watcher ошибка: {type(e).__name__}: {e}")
         print(f"[FATAL] {e}")
         sys.exit(0)
