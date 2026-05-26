@@ -2,10 +2,8 @@ name: RunPod GPU Watcher
 
 on:
   schedule:
-    - cron: '* * * * *'     # каждую минуту (GitHub может throttle до ~1/мин)
-  workflow_dispatch:          # ручной запуск
-  repository_dispatch:
-    types: [cron-trigger]     # cron-job.org каждую минуту
+    - cron: '*/10 * * * *'   # каждые 10 минут
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,6 +20,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Install deps
+        run: pip install -q PyNaCl cryptography
 
       - name: Run monitor
         env:
