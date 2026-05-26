@@ -1,1 +1,1 @@
-{"status":"EXITED","running":false,"gpus":0,"gpu_confirmed":false,"last_resume_ts":0,"resume_attempts":0,"report_ts":0,"n":0}
+{"status":"EXITED","running":false,"gpus":0,"gpu_confirmed":false,"checks":0,"attempts":0,"total_att":0,"report_ts":0}
