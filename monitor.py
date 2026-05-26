@@ -15,7 +15,7 @@ POD_ID      = os.environ.get("POD_ID",  "06187ayaswoyq2")
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "0") == "1"
 STATE_FILE  = Path("state.json")
 
-RESUME_COOLDOWN = 20 * 60  # не чаще раза в 20 мин
+RESUME_COOLDOWN = 9 * 60   # попытка каждые 10 мин (9 = с запасом для cron drift)
 
 
 def pdt():
@@ -210,7 +210,7 @@ def main():
             print(f"[AUTO_RESUME] Кулдаун — следующая попытка через {wait_min} мин")
 
     # ── Отчёт каждые 10 мин ──────────────────────────────────────────────────
-    if now - state.get("report_ts", 0) >= 10 * 60:
+    if now - state.get("report_ts", 0) >= 20 * 60:
         att = state.get("resume_attempts", 0)
         if truly_ready:
             msg = (
