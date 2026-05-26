@@ -2,8 +2,13 @@ name: RunPod GPU Watcher
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # каждые 10 минут
+    - cron: '*/20 * * * *'   # каждые 20 минут = 1 попытка запуска за цикл
   workflow_dispatch:
+
+# Не запускать параллельно — предыдущий должен закончить и закоммитить state.json
+concurrency:
+  group: runpod-watcher
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -11,18 +16,17 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install deps
-        run: pip install -q PyNaCl cryptography
 
       - name: Run monitor
         env:
