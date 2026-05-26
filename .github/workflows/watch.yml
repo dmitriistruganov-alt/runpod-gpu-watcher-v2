@@ -45,7 +45,7 @@ jobs:
       - name: Queue next run in ~55s
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SELF_TRIGGER_TOKEN }}
         run: |
           sleep 55
           gh workflow run watch.yml --repo ${{ github.repository }} || true
