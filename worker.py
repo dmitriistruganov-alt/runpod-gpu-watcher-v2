@@ -41,6 +41,9 @@ AUTO_RESUME     = os.environ.get("AUTO_RESUME", "1") == "1"
 
 POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", "60"))      # проверка раз в минуту
 REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "1200"))  # отчёт каждые 20 мин
+ON_WARN_INTERVAL = int(os.environ.get("ON_WARN_INTERVAL", "600")) # напоминать "под ВКЛЮЧЕН" каждые 10 мин
+COST_PER_HR     = float(os.environ.get("COST_PER_HR", "0.945"))   # $/час когда под работает
+LOW_BALANCE     = float(os.environ.get("LOW_BALANCE", "3.0"))     # предупреждать когда баланс ниже, $
 
 START_TS = time.time()
 
@@ -113,20 +116,23 @@ def runpod_gql(query: str) -> dict:
 
 
 def get_status() -> dict | None:
-    """РЕАЛЬНЫЙ статус пода: запущен ли + сколько GPU реально работает."""
+    """РЕАЛЬНЫЙ статус пода + баланс аккаунта (один запрос)."""
     q = (f'query {{ pod(input: {{podId: "{POD_ID}"}}) {{ '
-         f'name desiredStatus runtime {{ uptimeInSeconds gpus {{ id }} }} }} }}')
+         f'name desiredStatus runtime {{ uptimeInSeconds gpus {{ id }} }} }} '
+         f'myself {{ clientBalance }} }}')
     data = runpod_gql(q)
     pod = data.get("pod")
     if pod is None:
         return None
     rt = pod.get("runtime")
     gpus = (rt.get("gpus") or []) if rt else []
+    balance = (data.get("myself") or {}).get("clientBalance")
     return {
         "status": pod.get("desiredStatus", "UNKNOWN"),
         "running": rt is not None,
         "gpus": len(gpus),
         "uptime": rt.get("uptimeInSeconds", 0) if rt else 0,
+        "balance": balance,
     }
 
 
@@ -163,6 +169,8 @@ def main():
 
     prev_status = None
     running_alerted = False        # чтобы не спамить "GPU активен" каждую минуту
+    last_on_warn_ts = 0.0          # когда последний раз напоминали "под ВКЛЮЧЕН"
+    low_bal_alerted = False        # чтобы предупредить о низком балансе один раз
     last_report_ts = time.time()
 
     checks = 0
@@ -177,6 +185,8 @@ def main():
                 checks += 1
                 cur = info["status"]
 
+                bal = info.get("balance")
+
                 # ── под РАБОТАЕТ и GPU реально есть ──
                 if cur == "RUNNING" and info["gpus"] > 0:
                     gpu_caught += 1
@@ -188,6 +198,34 @@ def main():
                             f"Заходи: https://06187ayaswoyq2-8888.proxy.runpod.net"
                         )
                         running_alerted = True
+                        last_on_warn_ts = time.time()
+
+                    # ── ПРЕДУПРЕЖДЕНИЕ: под включён, идёт оплата (каждые 10 мин) ──
+                    if time.time() - last_on_warn_ts >= ON_WARN_INTERVAL:
+                        up_h = info["uptime"] / 3600
+                        spent = up_h * COST_PER_HR
+                        bal_line = f"\nБаланс: ${bal:.2f}" if bal is not None else ""
+                        hours_left = (f" (~{bal / COST_PER_HR:.1f}ч осталось)"
+                                      if bal is not None else "")
+                        send_tg(
+                            f"⚠️ <b>ПОД ВКЛЮЧЁН — идёт оплата!</b>  {now_pdt()}\n"
+                            f"Работает: {fmt_dur(info['uptime'])} · "
+                            f"потрачено ~${spent:.2f}"
+                            f"{bal_line}{hours_left}\n"
+                            f"Не забудь выключить, когда закончишь."
+                        )
+                        last_on_warn_ts = time.time()
+
+                    # ── предупреждение о низком балансе (один раз) ──
+                    if bal is not None and bal < LOW_BALANCE and not low_bal_alerted:
+                        send_tg(
+                            f"🔴 <b>НИЗКИЙ БАЛАНС RunPod!</b>  {now_pdt()}\n"
+                            f"Осталось ${bal:.2f} (~{bal / COST_PER_HR:.1f}ч). "
+                            f"Пополни, иначе под скоро отключится."
+                        )
+                        low_bal_alerted = True
+                    if bal is not None and bal >= LOW_BALANCE:
+                        low_bal_alerted = False  # сброс после пополнения
 
                 # ── под выключен → честно пробуем поймать GPU ──
                 elif cur == "EXITED":
@@ -224,6 +262,8 @@ def main():
             if time.time() - last_report_ts >= REPORT_INTERVAL:
                 st = prev_status or "?"
                 emoji = "🟢" if st == "RUNNING" else "🔴"
+                bal = (info or {}).get("balance") if info else None
+                bal_line = f"\nБаланс RunPod: ${bal:.2f}" if bal is not None else ""
                 send_tg(
                     f"📊 <b>Отчёт за {REPORT_INTERVAL // 60} мин</b>  {now_pdt()}\n"
                     f"Под сейчас: {emoji} {st}\n"
@@ -231,6 +271,7 @@ def main():
                     f"GPU был доступен: <b>{gpu_caught}</b> раз\n"
                     f"Последний раз GPU: {last_caught_str}\n"
                     f"Аптайм воркера: {fmt_dur(time.time() - START_TS)}"
+                    f"{bal_line}"
                 )
                 last_report_ts = time.time()
                 checks = 0

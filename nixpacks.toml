@@ -1,0 +1,6 @@
+# Форсируем Python-окружение, чтобы Nixpacks не угадывал и не лез в подпапки.
+[phases.setup]
+nixPkgs = ["python311"]
+
+[start]
+cmd = "python worker.py"
