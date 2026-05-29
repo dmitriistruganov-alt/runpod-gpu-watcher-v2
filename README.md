@@ -24,7 +24,7 @@
 | `POD_ID` | `06187ayaswoyq2` |
 
 Необязательные (есть значения по умолчанию): `GPU_TYPE`, `GPU_COUNT`,
-`POLL_INTERVAL` (сек, по умолчанию 10), `REPORT_INTERVAL` (сек, 1200),
+`POLL_INTERVAL` (сек, по умолчанию 60 — раз в минуту), `REPORT_INTERVAL` (сек, 1200),
 `ALERT_COOLDOWN` (сек, 300).
 
 После добавления переменных Railway передеплоит — в Telegram придёт

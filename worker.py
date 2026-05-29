@@ -30,7 +30,7 @@ POD_ID          = os.environ.get("POD_ID", "06187ayaswoyq2")
 GPU_TYPE        = os.environ.get("GPU_TYPE", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition")
 GPU_COUNT       = int(os.environ.get("GPU_COUNT", "1"))
 
-POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", "10"))      # как часто проверять, сек
+POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", "60"))      # как часто проверять, сек (раз в минуту)
 REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "1200"))  # отчёт каждые 20 мин
 ALERT_COOLDOWN  = int(os.environ.get("ALERT_COOLDOWN", "300"))    # повтор алерта пока GPU есть, сек
 
