@@ -192,10 +192,14 @@ def main():
                     gpu_caught += 1
                     last_caught_str = now_pdt()
                     if not running_alerted:
+                        bal_l = f"\n💰 Баланс: ${bal:.2f}" if bal is not None else ""
                         send_tg(
-                            f"✅ <b>GPU АКТИВЕН — под работает!</b>  {now_pdt()}\n"
-                            f"GPU: {info['gpus']} шт · аптайм {fmt_dur(info['uptime'])}\n"
-                            f"Заходи: https://06187ayaswoyq2-8888.proxy.runpod.net"
+                            f"🟢🟢🟢 <b>ПОД ВКЛЮЧЁН!</b> 🟢🟢🟢  {now_pdt()}\n\n"
+                            f"<b>GPU РАБОТАЕТ</b> · {info['gpus']} шт · "
+                            f"аптайм {fmt_dur(info['uptime'])}{bal_l}\n"
+                            f"⚠️ ИДЁТ ОПЛАТА ${COST_PER_HR}/ч\n\n"
+                            f"Jupyter: https://06187ayaswoyq2-8888.proxy.runpod.net\n"
+                            f"ComfyUI: https://06187ayaswoyq2-8188.proxy.runpod.net"
                         )
                         running_alerted = True
                         last_on_warn_ts = time.time()
