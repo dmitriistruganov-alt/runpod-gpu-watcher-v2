@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-RunPod GPU Watcher — постоянный воркер (Railway, 24/7).
+RunPod GPU Watcher v4 — честная проверка, без фейков.
 
-Что делает:
-  - каждые POLL_INTERVAL сек дёргает РЕАЛЬНЫЙ RunPod API (никаких фейков);
-  - один GraphQL-запрос отдаёт статус пода + наличие GPU нужного типа;
-  - как только GPU появляется в наличии для выключенного пода — мгновенно
-    шлёт в Telegram «GPU доступен, заходи и жми Resume»;
-  - повторно пингует пока GPU держится (раз в ALERT_COOLDOWN сек), чтобы не спамить;
-  - каждые REPORT_INTERVAL (20 мин) шлёт отчёт: сколько проверок, сколько раз
-    GPU был доступен, время последней доступности, аптайм воркера.
+ПОЧЕМУ v4:
+  Для RTX PRO 6000 (и A100) RunPod НЕ отдаёт сток через API — поля
+  stockStatus / price / rentedCount всегда null. Поэтому проверка "по стоку"
+  для этого GPU физически не работает — бот всегда думал, что GPU нет.
+  Проверено вживую: 4090 даёт stockStatus="Low", а PRO 6000 — null.
 
-Работает независимо от компа — крутится на Railway.
-Зависимостей нет (только стандартная библиотека Python).
+ЧТО ДЕЛАЕТ v4 (только реальные данные):
+  1. Каждую минуту берёт РЕАЛЬНЫЙ статус пода (desiredStatus + runtime.gpus).
+  2. Если под RUNNING и у него есть GPU — пишет "✅ GPU активен" (это решает
+     случай "я сам включил, а бот пишет нет" — теперь бот это видит).
+  3. Если под EXITED и AUTO_RESUME=1 — реально пытается запустить под
+     (podResume). Получилось → GPU был свободен → "🚀 GPU СВОБОДЕН, под запущен".
+     Не получилось → GPU нет, тихо ждёт. Это единственный 100% честный способ
+     узнать наличие этого GPU.
+  4. Каждые 20 мин — отчёт: проверок, поймано GPU, время, аптайм.
+
+Работает 24/7 на Railway, не зависит от компа. Зависимостей нет (stdlib).
 """
 import json
 import os
@@ -22,31 +28,31 @@ import time
 import http.client
 import urllib.request
 
-# ── Конфиг (значения берутся из переменных окружения Railway) ────────────────
+# ── Конфиг (значения из переменных окружения Railway) ────────────────────────
 TG_TOKEN        = os.environ.get("TG_TOKEN", "")
 TG_CHAT         = os.environ.get("TG_CHAT", "6356247638")
 RUNPOD_KEY      = os.environ.get("RUNPOD_KEY", "")
 POD_ID          = os.environ.get("POD_ID", "06187ayaswoyq2")
-GPU_TYPE        = os.environ.get("GPU_TYPE", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition")
 GPU_COUNT       = int(os.environ.get("GPU_COUNT", "1"))
 
-POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", "60"))      # как часто проверять, сек (раз в минуту)
+# AUTO_RESUME=1 — бот сам пытается поймать GPU (запускает под). Это и есть
+# единственная честная проверка наличия для RTX PRO 6000. По умолчанию ВКЛ.
+AUTO_RESUME     = os.environ.get("AUTO_RESUME", "1") == "1"
+
+POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", "60"))      # проверка раз в минуту
 REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "1200"))  # отчёт каждые 20 мин
-ALERT_COOLDOWN  = int(os.environ.get("ALERT_COOLDOWN", "300"))    # повтор алерта пока GPU есть, сек
 
 START_TS = time.time()
 
 
-# ── Время по PDT (Лос-Анджелес, где обычно дата-центры) ──────────────────────
 def now_pdt() -> str:
     u = time.gmtime()
     return f"{(u.tm_hour - 7) % 24:02d}:{u.tm_min:02d} PDT"
 
 
-def fmt_dur(sec: int) -> str:
+def fmt_dur(sec) -> str:
     sec = int(sec)
-    h, m = sec // 3600, (sec % 3600) // 60
-    return f"{h}ч {m}м"
+    return f"{sec // 3600}ч {(sec % 3600) // 60}м"
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
@@ -80,7 +86,7 @@ def runpod_gql(query: str) -> dict:
         return {}
     body = json.dumps({"query": query}).encode("utf-8")
     conn = http.client.HTTPSConnection(
-        "api.runpod.io", timeout=20, context=ssl.create_default_context()
+        "api.runpod.io", timeout=25, context=ssl.create_default_context()
     )
     try:
         conn.request(
@@ -88,14 +94,17 @@ def runpod_gql(query: str) -> dict:
             f"/graphql?api_key={RUNPOD_KEY}",
             body=body,
             headers={"Content-Type": "application/json",
-                     "User-Agent": "runpod-watcher/3.0"},
+                     "User-Agent": "runpod-watcher/4.0"},
         )
         resp = conn.getresponse()
         raw = resp.read().decode("utf-8")
         if resp.status != 200:
             print(f"[RunPod] HTTP {resp.status}: {raw[:200]}", flush=True)
             return {}
-        return json.loads(raw).get("data") or {}
+        parsed = json.loads(raw)
+        if parsed.get("errors"):
+            print(f"[RunPod] GQL errors: {parsed['errors'][:1]}", flush=True)
+        return parsed.get("data") or {}
     except Exception as e:
         print(f"[RunPod] Error: {e}", flush=True)
         return {}
@@ -103,108 +112,113 @@ def runpod_gql(query: str) -> dict:
         conn.close()
 
 
-def poll() -> dict | None:
-    """Один запрос: статус пода + наличие GPU нужного типа."""
-    q = (
-        'query { '
-        f'pod(input: {{podId: "{POD_ID}"}}) {{ name desiredStatus '
-        'runtime { uptimeInSeconds gpus { gpuUtilPercent } } } '
-        f'gpuTypes(input: {{id: "{GPU_TYPE}"}}) {{ displayName '
-        f'lowestPrice(input: {{gpuCount: {GPU_COUNT}}}) {{ stockStatus uninterruptablePrice }} }} '
-        '}'
-    )
+def get_status() -> dict | None:
+    """РЕАЛЬНЫЙ статус пода: запущен ли + сколько GPU реально работает."""
+    q = (f'query {{ pod(input: {{podId: "{POD_ID}"}}) {{ '
+         f'name desiredStatus runtime {{ uptimeInSeconds gpus {{ id }} }} }} }}')
     data = runpod_gql(q)
-    if not data:
-        return None
-
     pod = data.get("pod")
     if pod is None:
-        print("[SKIP] под не найден в ответе API", flush=True)
         return None
-
     rt = pod.get("runtime")
-    gpu_types = data.get("gpuTypes") or []
-    price = (gpu_types[0].get("lowestPrice") or {}) if gpu_types else {}
-    stock = price.get("stockStatus")
-    rent_price = price.get("uninterruptablePrice")
-
-    # GPU "появился", если RunPod показывает наличие на secure cloud:
-    #   stockStatus != null  ИЛИ  есть цена аренды.
-    available = bool(stock) or rent_price is not None
-
+    gpus = (rt.get("gpus") or []) if rt else []
     return {
         "status": pod.get("desiredStatus", "UNKNOWN"),
         "running": rt is not None,
+        "gpus": len(gpus),
         "uptime": rt.get("uptimeInSeconds", 0) if rt else 0,
-        "gpu_available": available,
-        "stock": stock,
-        "price": rent_price,
     }
+
+
+def try_resume() -> bool:
+    """Реальная попытка запустить под. Это и есть честная проверка наличия GPU.
+
+    Проверено вживую на реальном API:
+      - GPU занят  → {"errors":[{"message":"There are not enough free GPUs..."}],
+                      "data":{"podResume":null}}  → возвращаем False
+      - GPU свободен → {"data":{"podResume":{"id":..,"desiredStatus":"RESUMED"}}}
+                      → возвращаем True (статус может быть RESUMED или RUNNING —
+                        НЕ привязываемся к строке, важен сам факт ненулевого ответа)
+    """
+    q = (f'mutation {{ podResume(input: {{podId: "{POD_ID}", gpuCount: {GPU_COUNT}}}) '
+         f'{{ id desiredStatus }} }}')
+    data = runpod_gql(q)
+    res = data.get("podResume")
+    # Успех = RunPod вернул объект пода. При нехватке GPU тут null.
+    return res is not None
 
 
 # ── Главный цикл ─────────────────────────────────────────────────────────────
 def main():
-    print(f"[{now_pdt()}] Watcher v3 запущен | pod={POD_ID} | "
-          f"poll={POLL_INTERVAL}s | report={REPORT_INTERVAL}s", flush=True)
+    print(f"[{now_pdt()}] Watcher v4 | pod={POD_ID} | poll={POLL_INTERVAL}s | "
+          f"AUTO_RESUME={AUTO_RESUME}", flush=True)
+    mode = ("сам ловит GPU (auto-resume) и пишет когда поймал"
+            if AUTO_RESUME else "только следит за статусом")
     send_tg(
-        f"🤖 <b>RunPod Watcher запущен</b>  {now_pdt()}\n"
-        f"Под: <code>{POD_ID}</code>\n"
-        f"GPU: RTX PRO 6000 Blackwell\n"
-        f"Проверка каждые {POLL_INTERVAL} сек. Отчёт каждые {REPORT_INTERVAL // 60} мин.\n"
-        f"Жду появления GPU…"
+        f"🤖 <b>RunPod Watcher v4 запущен</b>  {now_pdt()}\n"
+        f"Под: <code>{POD_ID}</code> · RTX PRO 6000\n"
+        f"Режим: {mode}\n"
+        f"Проверка раз в {POLL_INTERVAL} сек · отчёт каждые {REPORT_INTERVAL // 60} мин"
     )
 
     prev_status = None
-    last_alert_ts = 0.0          # когда последний раз слали алерт о наличии GPU
+    running_alerted = False        # чтобы не спамить "GPU активен" каждую минуту
     last_report_ts = time.time()
 
-    # счётчики за окно отчёта
     checks = 0
-    gpu_hits = 0                 # сколько раз за окно GPU был доступен
-    last_available_str = "—"
+    gpu_caught = 0                 # сколько раз за окно реально поймали/увидели GPU
+    last_caught_str = "—"
 
     while True:
         loop_start = time.time()
         try:
-            info = poll()
+            info = get_status()
             if info is not None:
                 checks += 1
                 cur = info["status"]
 
-                # ── под сам сменил статус (ты вручную запустил/остановил) ──
-                if prev_status is not None and cur != prev_status:
-                    if prev_status == "EXITED" and cur == "RUNNING":
-                        send_tg(f"🟢 <b>Под запущен</b>  {now_pdt()}\n"
-                                f"Аптайм: {fmt_dur(info['uptime'])}")
-                    elif prev_status == "RUNNING" and cur == "EXITED":
-                        # под выключился — снова в поиск GPU
-                        send_tg(f"🔴 <b>Под остановлен</b>  {now_pdt()}\n"
-                                f"Снова ищу GPU…")
-                        last_alert_ts = 0
-                prev_status = cur
-
-                # ── главное: ищем GPU только пока под выключен ──
-                if cur == "EXITED" and info["gpu_available"]:
-                    gpu_hits += 1
-                    last_available_str = now_pdt()
-                    if time.time() - last_alert_ts >= ALERT_COOLDOWN:
-                        stock = info["stock"] or "есть"
-                        price = info["price"]
-                        price_str = f" · ${price}/ч" if price is not None else ""
+                # ── под РАБОТАЕТ и GPU реально есть ──
+                if cur == "RUNNING" and info["gpus"] > 0:
+                    gpu_caught += 1
+                    last_caught_str = now_pdt()
+                    if not running_alerted:
                         send_tg(
-                            f"🚀 <b>GPU ДОСТУПЕН!</b>  {now_pdt()}\n"
-                            f"RTX PRO 6000 Blackwell · наличие: {stock}{price_str}\n\n"
-                            f"⚡ Заходи в RunPod и жми <b>Resume</b> на поде "
-                            f"<code>{POD_ID}</code> — успей пока не разобрали!"
+                            f"✅ <b>GPU АКТИВЕН — под работает!</b>  {now_pdt()}\n"
+                            f"GPU: {info['gpus']} шт · аптайм {fmt_dur(info['uptime'])}\n"
+                            f"Заходи: https://06187ayaswoyq2-8888.proxy.runpod.net"
                         )
-                        last_alert_ts = time.time()
+                        running_alerted = True
 
-                status_emoji = "🟢" if cur == "RUNNING" else "🔴"
-                print(f"[{now_pdt()}] {status_emoji} {cur} | "
-                      f"gpu_avail={info['gpu_available']} stock={info['stock']} | "
-                      f"checks={checks} hits={gpu_hits}", flush=True)
+                # ── под выключен → честно пробуем поймать GPU ──
+                elif cur == "EXITED":
+                    running_alerted = False
+                    if AUTO_RESUME:
+                        if try_resume():
+                            gpu_caught += 1
+                            last_caught_str = now_pdt()
+                            send_tg(
+                                f"🚀 <b>GPU СВОБОДЕН — под ПОЙМАН и запущен!</b>  {now_pdt()}\n"
+                                f"Заходи скорее: "
+                                f"https://06187ayaswoyq2-8888.proxy.runpod.net\n"
+                                f"ComfyUI: https://06187ayaswoyq2-8188.proxy.runpod.net"
+                            )
+                            print(f"[{now_pdt()}] 🚀 RESUMED — GPU пойман!", flush=True)
+                        else:
+                            print(f"[{now_pdt()}] 🔴 EXITED · GPU занят на хосте, "
+                                  f"ждём · checks={checks}", flush=True)
+                    else:
+                        print(f"[{now_pdt()}] 🔴 EXITED · auto-resume выключен", flush=True)
+
+                # ── под включается/выключается, GPU ещё нет ──
+                else:
+                    running_alerted = False
+                    print(f"[{now_pdt()}] {cur} · gpus={info['gpus']} · "
+                          f"checks={checks}", flush=True)
+
+                prev_status = cur
             else:
-                print(f"[{now_pdt()}] API не ответил — повтор через {POLL_INTERVAL}s", flush=True)
+                print(f"[{now_pdt()}] API не ответил — повтор через {POLL_INTERVAL}s",
+                      flush=True)
 
             # ── отчёт каждые 20 минут ──
             if time.time() - last_report_ts >= REPORT_INTERVAL:
@@ -212,21 +226,20 @@ def main():
                 emoji = "🟢" if st == "RUNNING" else "🔴"
                 send_tg(
                     f"📊 <b>Отчёт за {REPORT_INTERVAL // 60} мин</b>  {now_pdt()}\n"
-                    f"Под: {emoji} {st}\n"
+                    f"Под сейчас: {emoji} {st}\n"
                     f"Проверок выполнено: <b>{checks}</b>\n"
-                    f"GPU был доступен: <b>{gpu_hits}</b> раз\n"
-                    f"Последний раз доступен: {last_available_str}\n"
+                    f"GPU был доступен: <b>{gpu_caught}</b> раз\n"
+                    f"Последний раз GPU: {last_caught_str}\n"
                     f"Аптайм воркера: {fmt_dur(time.time() - START_TS)}"
                 )
                 last_report_ts = time.time()
                 checks = 0
-                gpu_hits = 0
-                last_available_str = "—"
+                gpu_caught = 0
+                last_caught_str = "—"
 
         except Exception as e:
             print(f"[LOOP ERROR] {type(e).__name__}: {e}", flush=True)
 
-        # ── ровный интервал ──
         elapsed = time.time() - loop_start
         time.sleep(max(1, POLL_INTERVAL - elapsed))
 
