@@ -149,20 +149,20 @@ def get_status() -> dict | None:
 
 
 def try_resume() -> bool:
-    """Реальная попытка запустить под. Это и есть честная проверка наличия GPU.
+    """Реальная попытка запустить под — БЕЗ gpuCount (как веб-кнопка Resume).
 
-    Проверено вживую на реальном API:
-      - GPU занят  → {"errors":[{"message":"There are not enough free GPUs..."}],
-                      "data":{"podResume":null}}  → возвращаем False
-      - GPU свободен → {"data":{"podResume":{"id":..,"desiredStatus":"RESUMED"}}}
-                      → возвращаем True (статус может быть RESUMED или RUNNING —
-                        НЕ привязываемся к строке, важен сам факт ненулевого ответа)
+    КЛЮЧЕВОЙ ФИКС (проверено вживую 2026-05-30):
+      podResume С gpuCount:1  → "not enough free GPUs" (просит НОВЫЙ свободный GPU) ❌
+      podResume БЕЗ gpuCount  → {"desiredStatus":"RUNNING"} ✅ (возвращает поду
+                                его УЖЕ зарезервированный GPU — ровно как веб-кнопка)
+    Под привязан к машине через network volume, поэтому gpuCount заставлял RunPod
+    искать чужой свободный GPU и отказывать. Без него — берётся свой.
     """
-    q = (f'mutation {{ podResume(input: {{podId: "{POD_ID}", gpuCount: {GPU_COUNT}}}) '
+    q = (f'mutation {{ podResume(input: {{podId: "{POD_ID}"}}) '
          f'{{ id desiredStatus }} }}')
     data = runpod_gql(q)
     res = data.get("podResume")
-    # Успех = RunPod вернул объект пода. При нехватке GPU тут null.
+    # Успех = RunPod вернул объект пода (не null).
     return res is not None
 
 
