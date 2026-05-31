@@ -45,6 +45,18 @@ ON_WARN_INTERVAL = int(os.environ.get("ON_WARN_INTERVAL", "600")) # напоми
 COST_PER_HR     = float(os.environ.get("COST_PER_HR", "0.945"))   # $/час когда под работает
 LOW_BALANCE     = float(os.environ.get("LOW_BALANCE", "3.0"))     # предупреждать когда баланс ниже, $
 
+# ── Окно авто-запуска (по PDT) ───────────────────────────────────────────────
+# В часы [ACTIVE_START, ACTIVE_END) бот САМ ловит GPU (auto-resume).
+# Вне окна (ночью) — только следит и шлёт отчёты, под НЕ запускает.
+ACTIVE_START    = int(os.environ.get("ACTIVE_START", "7"))    # 07:00 PDT
+ACTIVE_END      = int(os.environ.get("ACTIVE_END", "23"))     # 23:00 PDT
+
+
+def in_active_window() -> bool:
+    """Сейчас рабочее окно ловли GPU? (по PDT)."""
+    hour = (time.gmtime().tm_hour - 7) % 24   # PDT = UTC-7
+    return ACTIVE_START <= hour < ACTIVE_END
+
 START_TS = time.time()
 
 
@@ -158,12 +170,14 @@ def try_resume() -> bool:
 def main():
     print(f"[{now_pdt()}] Watcher v4 | pod={POD_ID} | poll={POLL_INTERVAL}s | "
           f"AUTO_RESUME={AUTO_RESUME}", flush=True)
-    mode = ("сам ловит GPU (auto-resume) и пишет когда поймал"
+    win_now = "🟢 АКТИВНО" if in_active_window() else "🌙 НОЧЬ (жду утра)"
+    mode = (f"сам ловит GPU {ACTIVE_START}:00–{ACTIVE_END}:00 PDT, ночью только следит"
             if AUTO_RESUME else "только следит за статусом")
     send_tg(
-        f"🤖 <b>RunPod Watcher v4 запущен</b>  {now_pdt()}\n"
+        f"🤖 <b>RunPod Watcher v5 запущен</b>  {now_pdt()}\n"
         f"Под: <code>{POD_ID}</code> · RTX PRO 6000\n"
         f"Режим: {mode}\n"
+        f"Окно ловли GPU: <b>{ACTIVE_START}:00–{ACTIVE_END}:00 PDT</b> · сейчас {win_now}\n"
         f"Проверка раз в {POLL_INTERVAL} сек · отчёт каждые {REPORT_INTERVAL // 60} мин"
     )
 
@@ -234,7 +248,9 @@ def main():
                 # ── под выключен → честно пробуем поймать GPU ──
                 elif cur == "EXITED":
                     running_alerted = False
-                    if AUTO_RESUME:
+                    active = in_active_window()
+                    if AUTO_RESUME and active:
+                        # ── рабочее окно 07:00–23:00 PDT: ловим GPU ──
                         if try_resume():
                             gpu_caught += 1
                             last_caught_str = now_pdt()
@@ -248,6 +264,10 @@ def main():
                         else:
                             print(f"[{now_pdt()}] 🔴 EXITED · GPU занят на хосте, "
                                   f"ждём · checks={checks}", flush=True)
+                    elif AUTO_RESUME and not active:
+                        # ── ночь 23:00–07:00 PDT: только следим, GPU не ловим ──
+                        print(f"[{now_pdt()}] 🌙 НОЧЬ ({ACTIVE_START}:00–{ACTIVE_END}:00 PDT "
+                              f"окно выкл) · только слежу · checks={checks}", flush=True)
                     else:
                         print(f"[{now_pdt()}] 🔴 EXITED · auto-resume выключен", flush=True)
 
