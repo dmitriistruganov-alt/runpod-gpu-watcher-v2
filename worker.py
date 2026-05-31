@@ -255,31 +255,35 @@ def main():
                     if bal is not None and bal >= LOW_BALANCE:
                         low_bal_alerted = False  # сброс после пополнения
 
-                # ── под выключен → честно пробуем поймать GPU ──
+                # ── под выключен → ПРОВЕРЯЕМ GPU и СРАЗУ гасим (НЕ оставляем включённым) ──
                 elif cur == "EXITED":
                     running_alerted = False
                     active = in_active_window()
-                    if AUTO_RESUME and active:
-                        # ── рабочее окно 07:00–23:00 PDT: ловим GPU ──
-                        if try_resume():
+                    if active:
+                        # probe-and-stop, не чаще раза в ALERT_COOLDOWN (чтобы не мигать вкл/выкл)
+                        if time.time() - last_on_warn_ts < ALERT_COOLDOWN:
+                            print(f"[{now_pdt()}] ⏸ пауза после уведомления · "
+                                  f"checks={checks}", flush=True)
+                        elif probe_gpu():
                             gpu_caught += 1
                             last_caught_str = now_pdt()
                             send_tg(
-                                f"🚀 <b>GPU СВОБОДЕН — под ПОЙМАН и запущен!</b>  {now_pdt()}\n"
-                                f"Заходи скорее: "
-                                f"https://06187ayaswoyq2-8888.proxy.runpod.net\n"
-                                f"ComfyUI: https://06187ayaswoyq2-8188.proxy.runpod.net"
+                                f"🟢🟢🟢 <b>GPU СВОБОДЕН!</b> 🟢🟢🟢  {now_pdt()}\n\n"
+                                f"RTX PRO 6000 доступен ПРЯМО СЕЙЧАС.\n"
+                                f"⚡ Заходи в RunPod и ВКЛЮЧИ под САМ "
+                                f"(кнопка Resume) — успей пока не разобрали!\n\n"
+                                f"Под: <code>{POD_ID}</code> · бот оставил его выключенным."
                             )
-                            print(f"[{now_pdt()}] 🚀 RESUMED — GPU пойман!", flush=True)
+                            last_on_warn_ts = time.time()
+                            print(f"[{now_pdt()}] 🟢 GPU СВОБОДЕН — уведомил, под выключен · "
+                                  f"checks={checks}", flush=True)
                         else:
-                            print(f"[{now_pdt()}] 🔴 EXITED · GPU занят на хосте, "
-                                  f"ждём · checks={checks}", flush=True)
-                    elif AUTO_RESUME and not active:
-                        # ── ночь 23:00–07:00 PDT: только следим, GPU не ловим ──
+                            print(f"[{now_pdt()}] 🔴 EXITED · GPU занят · "
+                                  f"checks={checks}", flush=True)
+                    else:
+                        # ночь: только следим, под не трогаем
                         print(f"[{now_pdt()}] 🌙 НОЧЬ ({ACTIVE_START}:00–{ACTIVE_END}:00 PDT "
                               f"окно выкл) · только слежу · checks={checks}", flush=True)
-                    else:
-                        print(f"[{now_pdt()}] 🔴 EXITED · auto-resume выключен", flush=True)
 
                 # ── под включается/выключается, GPU ещё нет ──
                 else:
