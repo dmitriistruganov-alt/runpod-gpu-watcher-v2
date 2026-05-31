@@ -44,6 +44,7 @@ REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "1200"))  # отчёт �
 ON_WARN_INTERVAL = int(os.environ.get("ON_WARN_INTERVAL", "600")) # напоминать "под ВКЛЮЧЕН" каждые 10 мин
 COST_PER_HR     = float(os.environ.get("COST_PER_HR", "0.945"))   # $/час когда под работает
 LOW_BALANCE     = float(os.environ.get("LOW_BALANCE", "3.0"))     # предупреждать когда баланс ниже, $
+ALERT_COOLDOWN  = int(os.environ.get("ALERT_COOLDOWN", "300"))    # пауза между probe/уведомл. о свободном GPU, сек
 
 # ── Окно авто-запуска (по PDT) ───────────────────────────────────────────────
 # В часы [ACTIVE_START, ACTIVE_END) бот САМ ловит GPU (auto-resume).
@@ -148,36 +149,45 @@ def get_status() -> dict | None:
     }
 
 
-def try_resume() -> bool:
-    """Реальная попытка запустить под — БЕЗ gpuCount (как веб-кнопка Resume).
+def stop_pod() -> None:
+    """Немедленно выключить под (podStop)."""
+    q = f'mutation {{ podStop(input: {{podId: "{POD_ID}"}}) {{ desiredStatus }} }}'
+    runpod_gql(q)
 
-    КЛЮЧЕВОЙ ФИКС (проверено вживую 2026-05-30):
-      podResume С gpuCount:1  → "not enough free GPUs" (просит НОВЫЙ свободный GPU) ❌
-      podResume БЕЗ gpuCount  → {"desiredStatus":"RUNNING"} ✅ (возвращает поду
-                                его УЖЕ зарезервированный GPU — ровно как веб-кнопка)
-    Под привязан к машине через network volume, поэтому gpuCount заставлял RunPod
-    искать чужой свободный GPU и отказывать. Без него — берётся свой.
+
+def probe_gpu() -> bool:
+    """Проверка наличия GPU БЕЗ оставления пода включённым (probe-and-stop).
+
+    Бот НЕ запускает под для работы — он только ПРОВЕРЯЕТ есть ли GPU и СРАЗУ гасит.
+    Дмитрий включает под сам. Логика:
+      podResume БЕЗ gpuCount:
+        - GPU занят  → "not enough free GPUs", podResume=null → return False (молчим)
+        - GPU свободен → RUNNING (RunPod зарезервировал твой GPU) → СРАЗУ podStop,
+                         return True → шлём уведомление "GPU свободен, включай сам"
+    Так под никогда не остаётся включённым ботом и деньги не капают.
     """
     q = (f'mutation {{ podResume(input: {{podId: "{POD_ID}"}}) '
          f'{{ id desiredStatus }} }}')
     data = runpod_gql(q)
     res = data.get("podResume")
-    # Успех = RunPod вернул объект пода (не null).
-    return res is not None
+    if res is None:
+        return False  # GPU занят — resume отклонён
+    # GPU доступен — RunPod принял resume. СРАЗУ гасим, чтобы Дмитрий включил сам.
+    stop_pod()
+    return True
 
 
 # ── Главный цикл ─────────────────────────────────────────────────────────────
 def main():
-    print(f"[{now_pdt()}] Watcher v4 | pod={POD_ID} | poll={POLL_INTERVAL}s | "
-          f"AUTO_RESUME={AUTO_RESUME}", flush=True)
+    print(f"[{now_pdt()}] Watcher v6 (probe-only) | pod={POD_ID} | "
+          f"poll={POLL_INTERVAL}s | window={ACTIVE_START}-{ACTIVE_END} PDT", flush=True)
     win_now = "🟢 АКТИВНО" if in_active_window() else "🌙 НОЧЬ (жду утра)"
-    mode = (f"сам ловит GPU {ACTIVE_START}:00–{ACTIVE_END}:00 PDT, ночью только следит"
-            if AUTO_RESUME else "только следит за статусом")
     send_tg(
-        f"🤖 <b>RunPod Watcher v5 запущен</b>  {now_pdt()}\n"
+        f"🤖 <b>RunPod Watcher v6 запущен</b>  {now_pdt()}\n"
         f"Под: <code>{POD_ID}</code> · RTX PRO 6000\n"
-        f"Режим: {mode}\n"
-        f"Окно ловли GPU: <b>{ACTIVE_START}:00–{ACTIVE_END}:00 PDT</b> · сейчас {win_now}\n"
+        f"Режим: <b>ТОЛЬКО ПРОВЕРКА</b> — бот НЕ включает под сам.\n"
+        f"Видит свободный GPU → сразу гасит → шлёт «включай сам».\n"
+        f"Окно проверки: <b>{ACTIVE_START}:00–{ACTIVE_END}:00 PDT</b> · сейчас {win_now}\n"
         f"Проверка раз в {POLL_INTERVAL} сек · отчёт каждые {REPORT_INTERVAL // 60} мин"
     )
 
