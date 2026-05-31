@@ -45,6 +45,8 @@ ON_WARN_INTERVAL = int(os.environ.get("ON_WARN_INTERVAL", "600")) # напоми
 COST_PER_HR     = float(os.environ.get("COST_PER_HR", "0.945"))   # $/час когда под работает
 LOW_BALANCE     = float(os.environ.get("LOW_BALANCE", "3.0"))     # предупреждать когда баланс ниже, $
 ALERT_COOLDOWN  = int(os.environ.get("ALERT_COOLDOWN", "300"))    # пауза между probe/уведомл. о свободном GPU, сек
+GPU_WAIT        = int(os.environ.get("GPU_WAIT", "15"))           # сколько ждать после resume пока GPU подцепится, сек
+PROBE_INTERVAL  = int(os.environ.get("PROBE_INTERVAL", "120"))    # как часто делать probe (вкл/выкл пода стоит ресурса), сек
 
 # ── Окно авто-запуска (по PDT) ───────────────────────────────────────────────
 # В часы [ACTIVE_START, ACTIVE_END) бот САМ ловит GPU (auto-resume).
@@ -156,25 +158,44 @@ def stop_pod() -> None:
 
 
 def probe_gpu() -> bool:
-    """Проверка наличия GPU БЕЗ оставления пода включённым (probe-and-stop).
+    """Проверка РЕАЛЬНОГО наличия GPU (probe-and-stop).
 
-    Бот НЕ запускает под для работы — он только ПРОВЕРЯЕТ есть ли GPU и СРАЗУ гасит.
-    Дмитрий включает под сам. Логика:
-      podResume БЕЗ gpuCount:
-        - GPU занят  → "not enough free GPUs", podResume=null → return False (молчим)
-        - GPU свободен → RUNNING (RunPod зарезервировал твой GPU) → СРАЗУ podStop,
-                         return True → шлём уведомление "GPU свободен, включай сам"
-    Так под никогда не остаётся включённым ботом и деньги не капают.
+    КЛЮЧЕВОЙ ФИКС (консенсус 2026-05-31, проверено живым API + агентами):
+      podResume БЕЗ gpuCount ВСЕГДА возвращает RUNNING — даже когда GPU НЕТ!
+      После этого pod.runtime=null и gpus=0. Поэтому "ответ не null" = НЕ признак GPU.
+      ИСТИННЫЙ признак = runtime.gpus > 0 ПОСЛЕ запуска.
+
+    Алгоритм:
+      1. podResume (без gpuCount) — RunPod ставит RUNNING
+      2. ждём GPU_WAIT сек пока GPU реально подцепится (или нет)
+      3. проверяем pod.runtime.gpus:
+         - gpus > 0 → РЕАЛЬНЫЙ GPU есть → СРАЗУ podStop → return True (уведомить)
+         - gpus = 0 → GPU НЕ подцепился → СРАЗУ podStop → return False (молчать)
+    Под в любом случае гасится — Дмитрий включает сам.
     """
-    q = (f'mutation {{ podResume(input: {{podId: "{POD_ID}"}}) '
-         f'{{ id desiredStatus }} }}')
-    data = runpod_gql(q)
-    res = data.get("podResume")
-    if res is None:
-        return False  # GPU занят — resume отклонён
-    # GPU доступен — RunPod принял resume. СРАЗУ гасим, чтобы Дмитрий включил сам.
+    # 1. запускаем (RunPod всегда примет и поставит RUNNING)
+    q_resume = (f'mutation {{ podResume(input: {{podId: "{POD_ID}"}}) '
+                f'{{ id desiredStatus }} }}')
+    data = runpod_gql(q_resume)
+    if data.get("podResume") is None:
+        return False  # resume вообще отклонён (редко) — GPU точно нет
+
+    # 2. ждём пока GPU подцепится (или станет ясно что его нет)
+    time.sleep(GPU_WAIT)
+
+    # 3. проверяем РЕАЛЬНОЕ наличие GPU через runtime.gpus
+    q_check = (f'query {{ pod(input: {{podId: "{POD_ID}"}}) {{ '
+               f'runtime {{ gpus {{ id }} }} }} }}')
+    chk = runpod_gql(q_check)
+    pod = chk.get("pod") or {}
+    rt = pod.get("runtime")
+    gpus = len(rt.get("gpus") or []) if rt else 0
+
+    # 4. в ЛЮБОМ случае гасим под (Дмитрий включает сам)
     stop_pod()
-    return True
+
+    # GPU реально есть ТОЛЬКО если runtime.gpus > 0
+    return gpus > 0
 
 
 # ── Главный цикл ─────────────────────────────────────────────────────────────
@@ -193,7 +214,8 @@ def main():
 
     prev_status = None
     running_alerted = False        # чтобы не спамить "GPU активен" каждую минуту
-    last_on_warn_ts = 0.0          # когда последний раз напоминали "под ВКЛЮЧЕН"
+    last_on_warn_ts = 0.0          # когда последний раз слали "GPU СВОБОДЕН"
+    last_probe_ts = 0.0            # когда последний раз делали probe (resume/stop)
     low_bal_alerted = False        # чтобы предупредить о низком балансе один раз
     last_report_ts = time.time()
 
@@ -260,26 +282,34 @@ def main():
                     running_alerted = False
                     active = in_active_window()
                     if active:
-                        # probe-and-stop, не чаще раза в ALERT_COOLDOWN (чтобы не мигать вкл/выкл)
-                        if time.time() - last_on_warn_ts < ALERT_COOLDOWN:
-                            print(f"[{now_pdt()}] ⏸ пауза после уведомления · "
-                                  f"checks={checks}", flush=True)
-                        elif probe_gpu():
-                            gpu_caught += 1
-                            last_caught_str = now_pdt()
-                            send_tg(
-                                f"🟢🟢🟢 <b>GPU СВОБОДЕН!</b> 🟢🟢🟢  {now_pdt()}\n\n"
-                                f"RTX PRO 6000 доступен ПРЯМО СЕЙЧАС.\n"
-                                f"⚡ Заходи в RunPod и ВКЛЮЧИ под САМ "
-                                f"(кнопка Resume) — успей пока не разобрали!\n\n"
-                                f"Под: <code>{POD_ID}</code> · бот оставил его выключенным."
-                            )
-                            last_on_warn_ts = time.time()
-                            print(f"[{now_pdt()}] 🟢 GPU СВОБОДЕН — уведомил, под выключен · "
-                                  f"checks={checks}", flush=True)
+                        # probe реально запускает/гасит под → делаем не чаще PROBE_INTERVAL.
+                        # А после успешного уведомления — пауза ALERT_COOLDOWN.
+                        cooldown = (ALERT_COOLDOWN
+                                    if time.time() - last_on_warn_ts < ALERT_COOLDOWN
+                                    else PROBE_INTERVAL)
+                        if time.time() - last_probe_ts < cooldown:
+                            print(f"[{now_pdt()}] ⏸ EXITED · ждём (probe не чаще "
+                                  f"{cooldown}s) · checks={checks}", flush=True)
                         else:
-                            print(f"[{now_pdt()}] 🔴 EXITED · GPU занят · "
-                                  f"checks={checks}", flush=True)
+                            last_probe_ts = time.time()
+                            print(f"[{now_pdt()}] 🔎 probe GPU (resume→wait→check→stop)…",
+                                  flush=True)
+                            if probe_gpu():
+                                gpu_caught += 1
+                                last_caught_str = now_pdt()
+                                send_tg(
+                                    f"🟢🟢🟢 <b>GPU СВОБОДЕН!</b> 🟢🟢🟢  {now_pdt()}\n\n"
+                                    f"RTX PRO 6000 РЕАЛЬНО подцепился (проверено).\n"
+                                    f"⚡ Заходи в RunPod и ВКЛЮЧИ под САМ "
+                                    f"(кнопка Resume) — успей пока не разобрали!\n\n"
+                                    f"Под: <code>{POD_ID}</code> · бот оставил его выключенным."
+                                )
+                                last_on_warn_ts = time.time()
+                                print(f"[{now_pdt()}] 🟢 GPU РЕАЛЬНО ЕСТЬ — уведомил, "
+                                      f"под выключен · checks={checks}", flush=True)
+                            else:
+                                print(f"[{now_pdt()}] 🔴 GPU нет (gpus=0 после resume) · "
+                                      f"под выключен · checks={checks}", flush=True)
                     else:
                         # ночь: только следим, под не трогаем
                         print(f"[{now_pdt()}] 🌙 НОЧЬ ({ACTIVE_START}:00–{ACTIVE_END}:00 PDT "
