@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
 """
-RunPod GPU Watcher v4 — честная проверка, без фейков.
+RunPod GPU Watcher v7 — пассивный мониторинг.
 
-ПОЧЕМУ v4:
-  Для RTX PRO 6000 (и A100) RunPod НЕ отдаёт сток через API — поля
-  stockStatus / price / rentedCount всегда null. Поэтому проверка "по стоку"
-  для этого GPU физически не работает — бот всегда думал, что GPU нет.
-  Проверено вживую: 4090 даёт stockStatus="Low", а PRO 6000 — null.
-
-ЧТО ДЕЛАЕТ v4 (только реальные данные):
-  1. Каждую минуту берёт РЕАЛЬНЫЙ статус пода (desiredStatus + runtime.gpus).
-  2. Если под RUNNING и у него есть GPU — пишет "✅ GPU активен" (это решает
-     случай "я сам включил, а бот пишет нет" — теперь бот это видит).
-  3. Если под EXITED и AUTO_RESUME=1 — реально пытается запустить под
-     (podResume). Получилось → GPU был свободен → "🚀 GPU СВОБОДЕН, под запущен".
-     Не получилось → GPU нет, тихо ждёт. Это единственный 100% честный способ
-     узнать наличие этого GPU.
-  4. Каждые 20 мин — отчёт: проверок, поймано GPU, время, аптайм.
-
-Работает 24/7 на Railway, не зависит от компа. Зависимостей нет (stdlib).
+Дима включает/выключает под сам.
+Бот только смотрит и говорит:
+  - Под включился + GPU работает → уведомление
+  - Под выключился → уведомление
+  - Каждые 5 мин отчёт (если нужен)
+  - Каждые 10 мин напоминание пока под включён (идёт оплата)
+  - Баланс < LOW_BALANCE → предупреждение
 """
 import json
 import os
@@ -28,37 +18,15 @@ import time
 import http.client
 import urllib.request
 
-# ── Конфиг (значения из переменных окружения Railway) ────────────────────────
-TG_TOKEN        = os.environ.get("TG_TOKEN", "")
-TG_CHAT         = os.environ.get("TG_CHAT", "6356247638")
-RUNPOD_KEY      = os.environ.get("RUNPOD_KEY", "")
-POD_ID          = os.environ.get("POD_ID", "06187ayaswoyq2")
-GPU_COUNT       = int(os.environ.get("GPU_COUNT", "1"))
-
-# AUTO_RESUME=1 — бот сам пытается поймать GPU (запускает под). Это и есть
-# единственная честная проверка наличия для RTX PRO 6000. По умолчанию ВКЛ.
-AUTO_RESUME     = os.environ.get("AUTO_RESUME", "1") == "1"
-
-POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", "60"))      # проверка раз в минуту
-REPORT_INTERVAL = int(os.environ.get("REPORT_INTERVAL", "1200"))  # отчёт каждые 20 мин
-ON_WARN_INTERVAL = int(os.environ.get("ON_WARN_INTERVAL", "600")) # напоминать "под ВКЛЮЧЕН" каждые 10 мин
-COST_PER_HR     = float(os.environ.get("COST_PER_HR", "0.945"))   # $/час когда под работает
-LOW_BALANCE     = float(os.environ.get("LOW_BALANCE", "3.0"))     # предупреждать когда баланс ниже, $
-ALERT_COOLDOWN  = int(os.environ.get("ALERT_COOLDOWN", "300"))    # пауза между probe/уведомл. о свободном GPU, сек
-GPU_WAIT        = int(os.environ.get("GPU_WAIT", "5"))           # сколько ждать после resume пока GPU подцепится, сек
-PROBE_INTERVAL  = int(os.environ.get("PROBE_INTERVAL", "300"))    # как часто делать probe (вкл/выкл пода стоит ресурса), сек
-
-# ── Окно авто-запуска (по PDT) ───────────────────────────────────────────────
-# В часы [ACTIVE_START, ACTIVE_END) бот САМ ловит GPU (auto-resume).
-# Вне окна (ночью) — только следит и шлёт отчёты, под НЕ запускает.
-ACTIVE_START    = int(os.environ.get("ACTIVE_START", "7"))    # 07:00 PDT
-ACTIVE_END      = int(os.environ.get("ACTIVE_END", "23"))     # 23:00 PDT
-
-
-def in_active_window() -> bool:
-    """Сейчас рабочее окно ловли GPU? (по PDT)."""
-    hour = (time.gmtime().tm_hour - 7) % 24   # PDT = UTC-7
-    return ACTIVE_START <= hour < ACTIVE_END
+TG_TOKEN         = os.environ.get("TG_TOKEN", "")
+TG_CHAT          = os.environ.get("TG_CHAT", "6356247638")
+RUNPOD_KEY       = os.environ.get("RUNPOD_KEY", "")
+POD_ID           = os.environ.get("POD_ID", "06187ayaswoyq2")
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "300"))    # проверка раз в 5 мин
+REPORT_INTERVAL  = int(os.environ.get("REPORT_INTERVAL", "1200")) # отчёт каждые 20 мин
+ON_WARN_INTERVAL = int(os.environ.get("ON_WARN_INTERVAL", "600")) # напоминание об оплате каждые 10 мин
+COST_PER_HR      = float(os.environ.get("COST_PER_HR", "0.945"))
+LOW_BALANCE      = float(os.environ.get("LOW_BALANCE", "3.0"))
 
 START_TS = time.time()
 
@@ -73,7 +41,6 @@ def fmt_dur(sec) -> str:
     return f"{sec // 3600}ч {(sec % 3600) // 60}м"
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
 def send_tg(text: str):
     if not TG_TOKEN:
         print(f"[NO TG] {text[:80]}", flush=True)
@@ -92,15 +59,13 @@ def send_tg(text: str):
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             res = json.loads(r.read())
-            print(f"[TG {'OK' if res.get('ok') else 'FAIL'}] {text[:50]}", flush=True)
+            print(f"[TG {'OK' if res.get('ok') else 'FAIL'}] {text[:60]}", flush=True)
     except Exception as e:
         print(f"[TG ERROR] {e}", flush=True)
 
 
-# ── RunPod GraphQL (http.client — urllib иногда даёт 403 на этот эндпоинт) ────
 def runpod_gql(query: str) -> dict:
     if not RUNPOD_KEY:
-        print("[ERROR] RUNPOD_KEY не задан", flush=True)
         return {}
     body = json.dumps({"query": query}).encode("utf-8")
     conn = http.client.HTTPSConnection(
@@ -111,8 +76,7 @@ def runpod_gql(query: str) -> dict:
             "POST",
             f"/graphql?api_key={RUNPOD_KEY}",
             body=body,
-            headers={"Content-Type": "application/json",
-                     "User-Agent": "runpod-watcher/4.0"},
+            headers={"Content-Type": "application/json", "User-Agent": "runpod-watcher/7.0"},
         )
         resp = conn.getresponse()
         raw = resp.read().decode("utf-8")
@@ -120,8 +84,6 @@ def runpod_gql(query: str) -> dict:
             print(f"[RunPod] HTTP {resp.status}: {raw[:200]}", flush=True)
             return {}
         parsed = json.loads(raw)
-        if parsed.get("errors"):
-            print(f"[RunPod] GQL errors: {parsed['errors'][:1]}", flush=True)
         return parsed.get("data") or {}
     except Exception as e:
         print(f"[RunPod] Error: {e}", flush=True)
@@ -131,7 +93,6 @@ def runpod_gql(query: str) -> dict:
 
 
 def get_status() -> dict | None:
-    """РЕАЛЬНЫЙ статус пода + баланс аккаунта (один запрос)."""
     q = (f'query {{ pod(input: {{podId: "{POD_ID}"}}) {{ '
          f'name desiredStatus runtime {{ uptimeInSeconds gpus {{ id }} }} }} '
          f'myself {{ clientBalance }} }}')
@@ -143,85 +104,30 @@ def get_status() -> dict | None:
     gpus = (rt.get("gpus") or []) if rt else []
     balance = (data.get("myself") or {}).get("clientBalance")
     return {
-        "status": pod.get("desiredStatus", "UNKNOWN"),
+        "name":    pod.get("name", POD_ID),
+        "status":  pod.get("desiredStatus", "UNKNOWN"),
         "running": rt is not None,
-        "gpus": len(gpus),
-        "uptime": rt.get("uptimeInSeconds", 0) if rt else 0,
+        "gpus":    len(gpus),
+        "uptime":  rt.get("uptimeInSeconds", 0) if rt else 0,
         "balance": balance,
     }
 
 
-def stop_pod() -> None:
-    """Немедленно выключить под (podStop)."""
-    q = f'mutation {{ podStop(input: {{podId: "{POD_ID}"}}) {{ desiredStatus }} }}'
-    runpod_gql(q)
-
-
-def probe_gpu() -> bool:
-    """Проверка РЕАЛЬНОГО наличия GPU (probe-and-stop).
-
-    КЛЮЧЕВОЙ ФИКС (консенсус 2026-05-31, проверено живым API + агентами):
-      podResume БЕЗ gpuCount ВСЕГДА возвращает RUNNING — даже когда GPU НЕТ!
-      После этого pod.runtime=null и gpus=0. Поэтому "ответ не null" = НЕ признак GPU.
-      ИСТИННЫЙ признак = runtime.gpus > 0 ПОСЛЕ запуска.
-
-    Алгоритм:
-      1. podResume (без gpuCount) — RunPod ставит RUNNING
-      2. ждём GPU_WAIT сек пока GPU реально подцепится (или нет)
-      3. проверяем pod.runtime.gpus:
-         - gpus > 0 → РЕАЛЬНЫЙ GPU есть → СРАЗУ podStop → return True (уведомить)
-         - gpus = 0 → GPU НЕ подцепился → СРАЗУ podStop → return False (молчать)
-    Под в любом случае гасится — Дмитрий включает сам.
-    """
-    # 1. запускаем (RunPod всегда примет и поставит RUNNING)
-    q_resume = (f'mutation {{ podResume(input: {{podId: "{POD_ID}"}}) '
-                f'{{ id desiredStatus }} }}')
-    data = runpod_gql(q_resume)
-    if data.get("podResume") is None:
-        return False  # resume вообще отклонён (редко) — GPU точно нет
-
-    # 2. ждём пока GPU подцепится (или станет ясно что его нет)
-    time.sleep(GPU_WAIT)
-
-    # 3. проверяем РЕАЛЬНОЕ наличие GPU через runtime.gpus
-    q_check = (f'query {{ pod(input: {{podId: "{POD_ID}"}}) {{ '
-               f'runtime {{ gpus {{ id }} }} }} }}')
-    chk = runpod_gql(q_check)
-    pod = chk.get("pod") or {}
-    rt = pod.get("runtime")
-    gpus = len(rt.get("gpus") or []) if rt else 0
-
-    # 4. в ЛЮБОМ случае гасим под (Дмитрий включает сам)
-    stop_pod()
-
-    # GPU реально есть ТОЛЬКО если runtime.gpus > 0
-    return gpus > 0
-
-
-# ── Главный цикл ─────────────────────────────────────────────────────────────
 def main():
-    print(f"[{now_pdt()}] Watcher v6 (probe-only) | pod={POD_ID} | "
-          f"poll={POLL_INTERVAL}s | window={ACTIVE_START}-{ACTIVE_END} PDT", flush=True)
-    win_now = "🟢 АКТИВНО" if in_active_window() else "🌙 НОЧЬ (жду утра)"
+    print(f"[{now_pdt()}] Watcher v7 (пассивный) | pod={POD_ID} | poll={POLL_INTERVAL}s", flush=True)
     send_tg(
-        f"🤖 <b>RunPod Watcher v6 запущен</b>  {now_pdt()}\n"
-        f"Под: <code>{POD_ID}</code> · RTX PRO 6000\n"
-        f"Режим: <b>ТОЛЬКО ПРОВЕРКА</b> — бот НЕ включает под сам.\n"
-        f"Видит свободный GPU → сразу гасит → шлёт «включай сам».\n"
-        f"Окно проверки: <b>{ACTIVE_START}:00–{ACTIVE_END}:00 PDT</b> · сейчас {win_now}\n"
-        f"Проверка раз в {POLL_INTERVAL} сек · отчёт каждые {REPORT_INTERVAL // 60} мин"
+        f"🤖 <b>RunPod Watcher v7 запущен</b>  {now_pdt()}\n"
+        f"Под: <code>{POD_ID}</code>\n"
+        f"Режим: пассивный — Дима включает сам.\n"
+        f"Проверка раз в {POLL_INTERVAL // 60} мин · отчёт каждые {REPORT_INTERVAL // 60} мин"
     )
 
-    prev_status = None
-    running_alerted = False        # чтобы не спамить "GPU активен" каждую минуту
-    last_on_warn_ts = 0.0          # когда последний раз слали "GPU СВОБОДЕН"
-    last_probe_ts = 0.0            # когда последний раз делали probe (resume/stop)
-    low_bal_alerted = False        # чтобы предупредить о низком балансе один раз
+    prev_status   = None
+    running_alerted = False
+    last_warn_ts  = 0.0
+    low_bal_alert = False
     last_report_ts = time.time()
-
     checks = 0
-    gpu_caught = 0                 # сколько раз за окно реально поймали/увидели GPU
-    last_caught_str = "—"
 
     while True:
         loop_start = time.time()
@@ -230,121 +136,71 @@ def main():
             if info is not None:
                 checks += 1
                 cur = info["status"]
-
                 bal = info.get("balance")
 
-                # ── под РАБОТАЕТ и GPU реально есть ──
+                # ── под ВКЛЮЧЁН и GPU есть ──
                 if cur == "RUNNING" and info["gpus"] > 0:
-                    gpu_caught += 1
-                    last_caught_str = now_pdt()
                     if not running_alerted:
                         bal_l = f"\n💰 Баланс: ${bal:.2f}" if bal is not None else ""
                         send_tg(
-                            f"🟢🟢🟢 <b>ПОД ВКЛЮЧЁН!</b> 🟢🟢🟢  {now_pdt()}\n\n"
-                            f"<b>GPU РАБОТАЕТ</b> · {info['gpus']} шт · "
-                            f"аптайм {fmt_dur(info['uptime'])}{bal_l}\n"
-                            f"⚠️ ИДЁТ ОПЛАТА ${COST_PER_HR}/ч\n\n"
-                            f"Jupyter: https://06187ayaswoyq2-8888.proxy.runpod.net\n"
-                            f"ComfyUI: https://06187ayaswoyq2-8188.proxy.runpod.net"
+                            f"🟢 <b>Под ВКЛЮЧЁН, GPU работает</b>  {now_pdt()}\n"
+                            f"GPU: {info['gpus']} шт · аптайм {fmt_dur(info['uptime'])}{bal_l}\n"
+                            f"⚠️ Идёт оплата ${COST_PER_HR}/ч\n\n"
+                            f"Jupyter: https://{POD_ID}-8888.proxy.runpod.net\n"
+                            f"ComfyUI: https://{POD_ID}-8188.proxy.runpod.net"
                         )
                         running_alerted = True
-                        last_on_warn_ts = time.time()
+                        last_warn_ts = time.time()
 
-                    # ── ПРЕДУПРЕЖДЕНИЕ: под включён, идёт оплата (каждые 10 мин) ──
-                    if time.time() - last_on_warn_ts >= ON_WARN_INTERVAL:
+                    # напоминание об оплате каждые 10 мин
+                    if time.time() - last_warn_ts >= ON_WARN_INTERVAL:
                         up_h = info["uptime"] / 3600
                         spent = up_h * COST_PER_HR
                         bal_line = f"\nБаланс: ${bal:.2f}" if bal is not None else ""
-                        hours_left = (f" (~{bal / COST_PER_HR:.1f}ч осталось)"
-                                      if bal is not None else "")
                         send_tg(
-                            f"⚠️ <b>ПОД ВКЛЮЧЁН — идёт оплата!</b>  {now_pdt()}\n"
-                            f"Работает: {fmt_dur(info['uptime'])} · "
-                            f"потрачено ~${spent:.2f}"
-                            f"{bal_line}{hours_left}\n"
-                            f"Не забудь выключить, когда закончишь."
+                            f"⚠️ <b>Под включён — идёт оплата</b>  {now_pdt()}\n"
+                            f"Работает: {fmt_dur(info['uptime'])} · ~${spent:.2f} потрачено{bal_line}"
                         )
-                        last_on_warn_ts = time.time()
+                        last_warn_ts = time.time()
 
-                    # ── предупреждение о низком балансе (один раз) ──
-                    if bal is not None and bal < LOW_BALANCE and not low_bal_alerted:
-                        send_tg(
-                            f"🔴 <b>НИЗКИЙ БАЛАНС RunPod!</b>  {now_pdt()}\n"
-                            f"Осталось ${bal:.2f} (~{bal / COST_PER_HR:.1f}ч). "
-                            f"Пополни, иначе под скоро отключится."
-                        )
-                        low_bal_alerted = True
+                    # низкий баланс
+                    if bal is not None and bal < LOW_BALANCE and not low_bal_alert:
+                        send_tg(f"🔴 <b>Низкий баланс RunPod!</b>  ${bal:.2f} (~{bal/COST_PER_HR:.1f}ч)")
+                        low_bal_alert = True
                     if bal is not None and bal >= LOW_BALANCE:
-                        low_bal_alerted = False  # сброс после пополнения
+                        low_bal_alert = False
 
-                # ── под выключен → ПРОВЕРЯЕМ GPU и СРАЗУ гасим (НЕ оставляем включённым) ──
+                # ── под ВЫКЛЮЧЕН ──
                 elif cur == "EXITED":
+                    if running_alerted:
+                        send_tg(f"🔴 <b>Под выключен</b>  {now_pdt()}\nПод: <code>{POD_ID}</code>")
                     running_alerted = False
-                    active = in_active_window()
-                    if active:
-                        # probe реально запускает/гасит под → делаем не чаще PROBE_INTERVAL.
-                        # А после успешного уведомления — пауза ALERT_COOLDOWN.
-                        cooldown = (ALERT_COOLDOWN
-                                    if time.time() - last_on_warn_ts < ALERT_COOLDOWN
-                                    else PROBE_INTERVAL)
-                        if time.time() - last_probe_ts < cooldown:
-                            print(f"[{now_pdt()}] ⏸ EXITED · ждём (probe не чаще "
-                                  f"{cooldown}s) · checks={checks}", flush=True)
-                        else:
-                            last_probe_ts = time.time()
-                            print(f"[{now_pdt()}] 🔎 probe GPU (resume→wait→check→stop)…",
-                                  flush=True)
-                            if probe_gpu():
-                                gpu_caught += 1
-                                last_caught_str = now_pdt()
-                                send_tg(
-                                    f"🟢🟢🟢 <b>GPU СВОБОДЕН!</b> 🟢🟢🟢  {now_pdt()}\n\n"
-                                    f"RTX PRO 6000 РЕАЛЬНО подцепился (проверено).\n"
-                                    f"⚡ Заходи в RunPod и ВКЛЮЧИ под САМ "
-                                    f"(кнопка Resume) — успей пока не разобрали!\n\n"
-                                    f"Под: <code>{POD_ID}</code> · бот оставил его выключенным."
-                                )
-                                last_on_warn_ts = time.time()
-                                print(f"[{now_pdt()}] 🟢 GPU РЕАЛЬНО ЕСТЬ — уведомил, "
-                                      f"под выключен · checks={checks}", flush=True)
-                            else:
-                                print(f"[{now_pdt()}] 🔴 GPU нет (gpus=0 после resume) · "
-                                      f"под выключен · checks={checks}", flush=True)
-                    else:
-                        # ночь: только следим, под не трогаем
-                        print(f"[{now_pdt()}] 🌙 НОЧЬ ({ACTIVE_START}:00–{ACTIVE_END}:00 PDT "
-                              f"окно выкл) · только слежу · checks={checks}", flush=True)
 
-                # ── под включается/выключается, GPU ещё нет ──
+                # ── промежуточный статус (стартует/останавливается) ──
                 else:
-                    running_alerted = False
-                    print(f"[{now_pdt()}] {cur} · gpus={info['gpus']} · "
-                          f"checks={checks}", flush=True)
+                    print(f"[{now_pdt()}] {cur} · gpus={info['gpus']}", flush=True)
 
+                print(f"[{now_pdt()}] {cur} | GPU={info['gpus']} | checks={checks}", flush=True)
                 prev_status = cur
-            else:
-                print(f"[{now_pdt()}] API не ответил — повтор через {POLL_INTERVAL}s",
-                      flush=True)
 
-            # ── отчёт каждые 20 минут ──
+            else:
+                print(f"[{now_pdt()}] API нет ответа", flush=True)
+
+            # отчёт каждые 20 мин
             if time.time() - last_report_ts >= REPORT_INTERVAL:
                 st = prev_status or "?"
                 emoji = "🟢" if st == "RUNNING" else "🔴"
                 bal = (info or {}).get("balance") if info else None
-                bal_line = f"\nБаланс RunPod: ${bal:.2f}" if bal is not None else ""
+                bal_line = f"\nБаланс: ${bal:.2f}" if bal is not None else ""
                 send_tg(
-                    f"📊 <b>Отчёт за {REPORT_INTERVAL // 60} мин</b>  {now_pdt()}\n"
-                    f"Под сейчас: {emoji} {st}\n"
-                    f"Проверок выполнено: <b>{checks}</b>\n"
-                    f"GPU был доступен: <b>{gpu_caught}</b> раз\n"
-                    f"Последний раз GPU: {last_caught_str}\n"
+                    f"📊 <b>Отчёт {REPORT_INTERVAL // 60} мин</b>  {now_pdt()}\n"
+                    f"Под: {emoji} {st}\n"
+                    f"Проверок: {checks}\n"
                     f"Аптайм воркера: {fmt_dur(time.time() - START_TS)}"
                     f"{bal_line}"
                 )
                 last_report_ts = time.time()
                 checks = 0
-                gpu_caught = 0
-                last_caught_str = "—"
 
         except Exception as e:
             print(f"[LOOP ERROR] {type(e).__name__}: {e}", flush=True)
