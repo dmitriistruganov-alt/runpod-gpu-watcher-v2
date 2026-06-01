@@ -45,8 +45,8 @@ ON_WARN_INTERVAL = int(os.environ.get("ON_WARN_INTERVAL", "600")) # напоми
 COST_PER_HR     = float(os.environ.get("COST_PER_HR", "0.945"))   # $/час когда под работает
 LOW_BALANCE     = float(os.environ.get("LOW_BALANCE", "3.0"))     # предупреждать когда баланс ниже, $
 ALERT_COOLDOWN  = int(os.environ.get("ALERT_COOLDOWN", "300"))    # пауза между probe/уведомл. о свободном GPU, сек
-GPU_WAIT        = int(os.environ.get("GPU_WAIT", "15"))           # сколько ждать после resume пока GPU подцепится, сек
-PROBE_INTERVAL  = int(os.environ.get("PROBE_INTERVAL", "120"))    # как часто делать probe (вкл/выкл пода стоит ресурса), сек
+GPU_WAIT        = int(os.environ.get("GPU_WAIT", "5"))           # сколько ждать после resume пока GPU подцепится, сек
+PROBE_INTERVAL  = int(os.environ.get("PROBE_INTERVAL", "300"))    # как часто делать probe (вкл/выкл пода стоит ресурса), сек
 
 # ── Окно авто-запуска (по PDT) ───────────────────────────────────────────────
 # В часы [ACTIVE_START, ACTIVE_END) бот САМ ловит GPU (auto-resume).
