@@ -1,9 +1,9 @@
 {
-  "status": "RUNNING",
-  "running": false,
+  "status": "EXITED",
+  "running": true,
   "gpus": 0,
   "gpu_confirmed": false,
-  "checks": 16,
+  "checks": 17,
   "attempts": 0,
   "total_att": 0,
   "report_ts": 1780356167,
