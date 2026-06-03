@@ -3,7 +3,7 @@
   "running": false,
   "gpus": 0,
   "gpu_confirmed": false,
-  "checks": 14,
+  "checks": 15,
   "attempts": 0,
   "total_att": 0,
   "report_ts": 1780488855,
