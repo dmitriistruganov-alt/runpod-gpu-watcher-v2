@@ -3,10 +3,10 @@
   "running": false,
   "gpus": 0,
   "gpu_confirmed": false,
-  "checks": 17,
+  "checks": 0,
   "attempts": 0,
   "total_att": 0,
-  "report_ts": 1780576264,
+  "report_ts": 1780577484,
   "last_err": "There are not enough free GPUs on the host machine to start this pod.",
   "gpu_notified": false
 }
