@@ -1,12 +1,12 @@
 {
   "status": "EXITED",
-  "running": true,
-  "gpus": 1,
+  "running": false,
+  "gpus": 0,
   "gpu_confirmed": false,
-  "checks": 0,
+  "checks": 1,
   "attempts": 0,
   "total_att": 0,
   "report_ts": 1780647797,
   "last_err": "There are not enough free GPUs on the host machine to start this pod.",
-  "gpu_notified": true
+  "gpu_notified": false
 }
