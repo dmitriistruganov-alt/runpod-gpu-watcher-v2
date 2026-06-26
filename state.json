@@ -9,7 +9,7 @@
   "report_ts": 1782494134,
   "last_err": "There are not enough free GPUs on the host machine to start this pod.",
   "gpu_notified": false,
-  "n": 0,
+  "n": 1,
   "found": 0,
   "last_status": "EXITED"
 }
