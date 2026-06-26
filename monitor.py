@@ -24,6 +24,7 @@ TG_CHAT     = os.environ.get("TG_CHAT",  "6356247638")
 RUNPOD_KEY  = os.environ.get("RUNPOD_KEY", "")
 POD_ID      = os.environ.get("POD_ID",  "06187ayaswoyq2")
 REPORT_SEC  = 3600                       # отчёт раз в час
+FREE_COOLDOWN_SEC = 1800                  # анти-спам: повтор «GPU свободен» не чаще 30 мин
 STATE_FILE  = Path("state.json")
 
 
@@ -128,7 +129,10 @@ def load_state():
 
 
 def save_state(s):
-    STATE_FILE.write_text(json.dumps(s, indent=2))
+    # атомарная запись: пишем во временный файл и переименовываем (без полу-записанного state.json)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s, indent=2))
+    tmp.replace(STATE_FILE)
 
 
 def main():
@@ -148,6 +152,7 @@ def main():
     # ── ЗАЩИТА: Дмитрий сам включил под и работает → НЕ трогаем, НЕ гасим ─────
     if status == "RUNNING" and gpus > 0:
         print("[GUARD] под RUNNING с GPU — ты работаешь, НЕ трогаю")
+        st["free_notify_ts"] = 0             # ты зашёл — сбрасываем cooldown на будущее
         if now - st.get("report_ts", 0) >= REPORT_SEC:
             send_tg(f"✅ <b>Под RUNNING с GPU</b>  {pdt()}\n"
                     f"Ты работаешь — вотчер не вмешивается. Uptime {fmt_up(uptime)}.")
@@ -157,15 +162,23 @@ def main():
         return
 
     # ── PROBE: под выключен → пробуем поймать свободный GPU ──────────────────
+    # DEBOUNCE: после уведомления «GPU свободен» НЕ дёргаем под и НЕ спамим
+    # COOLDOWN (по умолч. 30 мин) — иначе cron слал бы «заходи» каждые 5 мин,
+    # пока ты не зашёл, и зря включал бы под на ~40с каждый раз.
     got = False
     if status == "EXITED":
-        if resume_pod():
+        in_cooldown = (now - st.get("free_notify_ts", 0)) < FREE_COOLDOWN_SEC
+        if in_cooldown:
+            left = int((FREE_COOLDOWN_SEC - (now - st["free_notify_ts"])) // 60)
+            print(f"[COOLDOWN] уже сообщил про свободный GPU, тишина ещё ~{left} мин — probe пропущен")
+        elif resume_pod():
             got = True
             st["found"] = st.get("found", 0) + 1
+            st["free_notify_ts"] = now       # запомнить момент уведомления (анти-спам)
             send_tg(f"🟢🟢 <b>GPU СВОБОДЕН — ЗАХОДИ!</b> 🟢🟢  {pdt()}\n"
                     f"Под <code>{POD_ID}</code> · RTX PRO 6000.\n"
                     f"Включай вручную для работы, пока не перехватили.\n"
-                    f"<i>(бот под не держит — гашу обратно)</i>")
+                    f"<i>(бот под не держит — гашу обратно; повтор не раньше 30 мин)</i>")
             stop_pod()                       # НЕ оставляем включённым
     print(f"[{pdt()}] проверка #{st['n']} | GPU={'ДА' if got else 'нет'}")
 
