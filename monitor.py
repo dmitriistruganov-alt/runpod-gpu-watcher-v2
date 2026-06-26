@@ -25,6 +25,8 @@ RUNPOD_KEY  = os.environ.get("RUNPOD_KEY", "")
 POD_ID      = os.environ.get("POD_ID",  "06187ayaswoyq2")
 REPORT_SEC  = 3600                       # отчёт раз в час
 FREE_COOLDOWN_SEC = 1800                  # анти-спам: повтор «GPU свободен» не чаще 30 мин
+POST_OFF_GRACE  = 1800                    # после ТВОЕГО выключения пода — не дёргать probe 30 мин
+GPU_CONFIRM_SEC = 25                      # анти-фейк: подтвердить gpus>0 после resume (под в очереди ≠ GPU)
 STATE_FILE  = Path("state.json")
 
 
@@ -121,6 +123,18 @@ def stop_pod():
     print("[STOP] podStop отправлен")
 
 
+def confirm_gpu():
+    """Анти-фейк: podResume даёт RUNNING даже когда под просто в очереди БЕЗ GPU.
+    Реальный GPU засчитываем ТОЛЬКО если runtime.gpus>0 (поллим до GPU_CONFIRM_SEC)."""
+    deadline = time.time() + GPU_CONFIRM_SEC
+    while time.time() < deadline:
+        time.sleep(5)
+        _, g, _ = get_pod()
+        if g > 0:
+            return True
+    return False
+
+
 def load_state():
     try:
         return json.loads(STATE_FILE.read_text())
@@ -161,25 +175,36 @@ def main():
         save_state(st)
         return
 
+    # ── ДЕТЕКТ: ты сам выключил под (RUNNING → EXITED) → grace, не дёргать ────
+    if st.get("last_status") == "RUNNING" and status == "EXITED":
+        st["user_off_ts"] = now
+        print("[GRACE] ты только что выключил под — probe на паузе 30 мин (не включаю сразу)")
+
     # ── PROBE: под выключен → пробуем поймать свободный GPU ──────────────────
-    # DEBOUNCE: после уведомления «GPU свободен» НЕ дёргаем под и НЕ спамим
-    # COOLDOWN (по умолч. 30 мин) — иначе cron слал бы «заходи» каждые 5 мин,
-    # пока ты не зашёл, и зря включал бы под на ~40с каждый раз.
     got = False
     if status == "EXITED":
-        in_cooldown = (now - st.get("free_notify_ts", 0)) < FREE_COOLDOWN_SEC
-        if in_cooldown:
+        post_off  = (now - st.get("user_off_ts", 0)) < POST_OFF_GRACE
+        cooldown  = (now - st.get("free_notify_ts", 0)) < FREE_COOLDOWN_SEC
+        if post_off:
+            left = int((POST_OFF_GRACE - (now - st["user_off_ts"])) // 60)
+            print(f"[GRACE] ты выключил под ~недавно — probe пропущен ещё ~{left} мин (не включаю сразу)")
+        elif cooldown:
             left = int((FREE_COOLDOWN_SEC - (now - st["free_notify_ts"])) // 60)
-            print(f"[COOLDOWN] уже сообщил про свободный GPU, тишина ещё ~{left} мин — probe пропущен")
+            print(f"[COOLDOWN] уже сообщил про свободный GPU — тишина ещё ~{left} мин")
         elif resume_pod():
-            got = True
-            st["found"] = st.get("found", 0) + 1
-            st["free_notify_ts"] = now       # запомнить момент уведомления (анти-спам)
-            send_tg(f"🟢🟢 <b>GPU СВОБОДЕН — ЗАХОДИ!</b> 🟢🟢  {pdt()}\n"
-                    f"Под <code>{POD_ID}</code> · RTX PRO 6000.\n"
-                    f"Включай вручную для работы, пока не перехватили.\n"
-                    f"<i>(бот под не держит — гашу обратно; повтор не раньше 30 мин)</i>")
-            stop_pod()                       # НЕ оставляем включённым
+            # АНТИ-ФЕЙК: resume=RUNNING ещё не значит GPU выделен (под мог встать в очередь).
+            # Засчитываем ТОЛЬКО при подтверждённом runtime.gpus>0.
+            if confirm_gpu():
+                got = True
+                st["found"] = st.get("found", 0) + 1
+                st["free_notify_ts"] = now   # анти-спам
+                send_tg(f"🟢🟢 <b>GPU СВОБОДЕН — ЗАХОДИ!</b> 🟢🟢  {pdt()}\n"
+                        f"Под <code>{POD_ID}</code> · RTX PRO 6000.\n"
+                        f"Включай вручную для работы, пока не перехватили.\n"
+                        f"<i>(бот под не держит — гашу обратно; повтор не раньше 30 мин)</i>")
+            else:
+                print("[ANTI-FAKE] resume=RUNNING, но gpus=0 (под в очереди без GPU) — НЕ уведомляю")
+            stop_pod()                       # в любом случае гасим (и при фейке, и при находке)
     print(f"[{pdt()}] проверка #{st['n']} | GPU={'ДА' if got else 'нет'}")
 
     # ── Отчёт раз в час ─────────────────────────────────────────────────────
