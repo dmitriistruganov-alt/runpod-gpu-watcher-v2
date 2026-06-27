@@ -27,6 +27,7 @@ REPORT_SEC  = 3600                       # отчёт раз в час
 FREE_COOLDOWN_SEC = 1800                  # анти-спам: повтор «GPU свободен» не чаще 30 мин
 POST_OFF_GRACE  = 1800                    # после ТВОЕГО выключения пода — не дёргать probe 30 мин
 GPU_CONFIRM_SEC = 25                      # анти-фейк: подтвердить gpus>0 после resume (под в очереди ≠ GPU)
+OUR_PROBE_MAX_UP = 120                    # под с uptime>120с = НЕ наш probe, а рабочий под Дмитрия (анти-гонка)
 STATE_FILE  = Path("state.json")
 
 
@@ -125,14 +126,15 @@ def stop_pod():
 
 def confirm_gpu():
     """Анти-фейк: podResume даёт RUNNING даже когда под просто в очереди БЕЗ GPU.
-    Реальный GPU засчитываем ТОЛЬКО если runtime.gpus>0 (поллим до GPU_CONFIRM_SEC)."""
+    Возвращает (gpu_есть:bool, uptime:int). uptime нужен чтобы отличить НАШ свежий
+    probe (uptime секунды) от РАБОЧЕГО пода Дмитрия (uptime минуты/часы) — анти-гонка."""
     deadline = time.time() + GPU_CONFIRM_SEC
     while time.time() < deadline:
         time.sleep(5)
-        _, g, _ = get_pod()
+        _, g, u = get_pod()
         if g > 0:
-            return True
-    return False
+            return True, u
+    return False, 0
 
 
 def load_state():
@@ -154,6 +156,8 @@ def main():
     st  = load_state()
     now = int(time.time())
     st["n"] = st.get("n", 0) + 1
+    if not st.get("report_ts"):           # первый запуск/сброс state → отсчёт часа от сейчас (без мгновенного отчёта)
+        st["report_ts"] = now
 
     status, gpus, uptime = get_pod()
     if status is None:
@@ -193,8 +197,13 @@ def main():
             print(f"[COOLDOWN] уже сообщил про свободный GPU — тишина ещё ~{left} мин")
         elif resume_pod():
             # АНТИ-ФЕЙК: resume=RUNNING ещё не значит GPU выделен (под мог встать в очередь).
-            # Засчитываем ТОЛЬКО при подтверждённом runtime.gpus>0.
-            if confirm_gpu():
+            has_gpu, up_now = confirm_gpu()
+            if has_gpu and up_now > OUR_PROBE_MAX_UP:
+                # 🛡️ АНТИ-ГОНКА (нашёл Opus): под с большим uptime = это ТВОЙ рабочий под,
+                # ты зашёл между get_pod и resume. НЕ гасим и НЕ уведомляем — это не наш probe.
+                print(f"[RACE-GUARD] под занят тобой (uptime {up_now}s > {OUR_PROBE_MAX_UP}) — НЕ гашу, НЕ уведомляю")
+            elif has_gpu:
+                # НАШ свежий probe (uptime мал) поймал реально свободный GPU
                 got = True
                 st["found"] = st.get("found", 0) + 1
                 st["free_notify_ts"] = now   # анти-спам
@@ -202,9 +211,11 @@ def main():
                         f"Под <code>{POD_ID}</code> · RTX PRO 6000.\n"
                         f"Включай вручную для работы, пока не перехватили.\n"
                         f"<i>(бот под не держит — гашу обратно; повтор не раньше 30 мин)</i>")
+                stop_pod()                   # наш probe — гасим, ты включишь сам
             else:
+                # gpus=0 — под в очереди без GPU (наш фейковый probe) → гасим обратно
                 print("[ANTI-FAKE] resume=RUNNING, но gpus=0 (под в очереди без GPU) — НЕ уведомляю")
-            stop_pod()                       # в любом случае гасим (и при фейке, и при находке)
+                stop_pod()
     print(f"[{pdt()}] проверка #{st['n']} | GPU={'ДА' if got else 'нет'}")
 
     # ── Отчёт раз в час ─────────────────────────────────────────────────────
