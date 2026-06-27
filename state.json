@@ -6,11 +6,12 @@
   "checks": 7,
   "attempts": 0,
   "total_att": 0,
-  "report_ts": 1782548025,
+  "report_ts": 1782555910,
   "last_err": "There are not enough free GPUs on the host machine to start this pod.",
   "gpu_notified": false,
   "n": 0,
   "found": 0,
-  "last_status": "RUNNING",
-  "free_notify_ts": 0
+  "last_status": "EXITED",
+  "free_notify_ts": 0,
+  "user_off_ts": 1782555910
 }
